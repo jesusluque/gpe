@@ -145,6 +145,14 @@ public:
     /// that wants the sharp version calls notifyCompleted from its handler.
     void waitFor(Submission at);
 
+    /// The device underneath, for the optional interfaces a backend may
+    /// implement -- completion reporting, host staging. Not for allocating
+    /// through: a buffer taken from here would be outside the pool's table and
+    /// nothing would ever recycle it.
+    [[nodiscard]] const Device* nativeDevice() const noexcept {
+        return native_.get();
+    }
+
     /// The native handle behind a pooled one, for a backend that has to reach
     /// the real buffer -- and for the test that checks reuse really is reuse.
     /// `kInvalidBuffer` if the handle is stale.
