@@ -29,6 +29,10 @@ else()
 endif()
 message(STATUS "gpe backend: ${GPE_BACKEND}")
 
+# The card the PTX is generated for. sm_89 is Ada -- the L4 on the build
+# machine. PTX is forward compatible, so this is a floor and not a ceiling.
+set(GPE_CUDA_ARCH "sm_89" CACHE STRING "virtual architecture for nvcc -ptx")
+
 # --- the library --------------------------------------------------------------
 #
 # Sources are added by the phase that writes them. Until then this is the
@@ -72,6 +76,15 @@ if(GPE_SOURCES)
 else()
     target_include_directories(gpe INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_features(gpe INTERFACE cxx_std_20)
+endif()
+
+# --- kernels ------------------------------------------------------------------
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+if(NOT GPE_BACKEND STREQUAL "none")
+    include(CompileSlang)
+    gpe_compile_slang(scale ENTRY scaleMain)
+    gpe_write_kernel_header(gpe)
 endif()
 
 # --- tests --------------------------------------------------------------------
