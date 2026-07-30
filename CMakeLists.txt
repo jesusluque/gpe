@@ -106,6 +106,10 @@ if(NOT GPE_BACKEND STREQUAL "none")
     gpe_write_kernel_header(gpe)
 endif()
 
+# --- viewer -------------------------------------------------------------------
+
+add_subdirectory(viewer)
+
 # --- tests --------------------------------------------------------------------
 
 include(CTest)
