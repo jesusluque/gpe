@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cstdio>
 #include <thread>
+#include <utility>   // std::as_const -- libstdc++ does not pull it in
 
 namespace gpe {
 namespace {
