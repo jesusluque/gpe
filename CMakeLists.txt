@@ -72,6 +72,10 @@ if(GPE_SOURCES)
     if(GPE_BACKEND STREQUAL "Metal")
         target_link_libraries(gpe PRIVATE
             "-framework Metal" "-framework Foundation" "-framework QuartzCore")
+        # metal-cpp: header-only, Apache 2.0, vendored so a checkout builds
+        # without a trip to developer.apple.com.
+        target_include_directories(gpe PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/metal-cpp)
     elseif(GPE_BACKEND STREQUAL "CUDA")
         find_package(CUDAToolkit REQUIRED)
         # The driver API, not the runtime: the kernels are PTX in a blob and
