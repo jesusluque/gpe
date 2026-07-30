@@ -1,0 +1,30 @@
+# The build toolchain, pinned, so two machines building the same commit use the
+# same cmake and the same ninja.
+#
+# conda-forge only, and Miniforge rather than Anaconda: the Anaconda default
+# channels are not free for commercial use above a headcount this company is
+# well past, and a build environment is exactly the thing nobody re-reads the
+# licence of before shipping.
+#
+# What is deliberately NOT here:
+#
+#   CUDA. The driver is a system component and the toolkit has to match it;
+#   conda-forge's cuda-toolkit can be made to work, but then a machine has two
+#   nvcc on the PATH and which one CMake picks depends on activation order.
+#   One toolkit, installed the way the driver was.
+#
+#   Metal. There is no conda package for it and there never will be -- it comes
+#   with Xcode, and the Metal compiler in particular needs the full install
+#   rather than the Command Line Tools.
+name: gpe
+channels:
+  - conda-forge
+dependencies:
+  - cmake >=3.24
+  - ninja
+  - git
+  # Slang compiles the kernels to .ptx and .metallib at build time. Pinned
+  # because a shader compiler is a code generator, and a code generator that
+  # drifts between machines makes two binaries that behave differently from one
+  # commit.
+  - shader-slang

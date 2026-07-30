@@ -14,10 +14,31 @@ namespace gpe {
 /// An integer rather than a pointer because a CUDA allocation and a
 /// MTL::Buffer* are not the same kind of thing and never will be. The handle
 /// costs a lookup and buys a client that compiles unchanged on both.
-using BufferId = uint32_t;
+///
+/// Sixty-four bits, not thirty-two: the low half is a slot and the high half a
+/// generation, bumped every time the slot is reused. Every access checks it,
+/// in release builds as well as debug -- a use-after-release in a compositor
+/// does not crash, it silently reads whatever image took the slot, and wrong
+/// pixels can reach a master.
+using BufferId = uint64_t;
 
 /// A compiled kernel, looked up by name.
+///
+/// Thirty-two is plenty: kernels are loaded once and never recycled, so there
+/// is no slot to reuse and no generation to track.
 using KernelId = uint32_t;
+
+/// How a BufferId is cut up. The pool owns the meaning; this is here so that a
+/// crash dump or a log line can be read without the pool's header.
+inline constexpr int      kBufferSlotBits = 32;
+inline constexpr uint64_t kBufferSlotMask = (uint64_t{1} << kBufferSlotBits) - 1;
+
+[[nodiscard]] inline constexpr uint32_t bufferSlot(BufferId id) noexcept {
+    return static_cast<uint32_t>(id & kBufferSlotMask);
+}
+[[nodiscard]] inline constexpr uint32_t bufferGeneration(BufferId id) noexcept {
+    return static_cast<uint32_t>(id >> kBufferSlotBits);
+}
 
 /// Zero is nothing, for both. Returned by `alloc` and `load` when they fail.
 ///
