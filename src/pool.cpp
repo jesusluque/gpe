@@ -1,6 +1,8 @@
 // Copyright (c) 2026 gpe contributors.
 #include "pool.h"
 
+#include "gpe/args.h"
+
 #include <algorithm>
 #include <bit>
 #include <cassert>
@@ -255,12 +257,40 @@ KernelId PooledDevice::load(std::string_view name) { return native_->load(name);
 
 void PooledDevice::dispatch(KernelId kernel, Grid grid, const void* args,
                             size_t bytes) {
+    // The handles in the blob are ours, and the backend has never heard of
+    // them.
+    //
+    // Everywhere else the decorator translates -- upload, download, release all
+    // resolve a slot and hand the native handle down -- and this was the one
+    // place that forwarded the caller's bytes untouched. The backend then read
+    // a pooled handle, which is a slot in the low half and a generation in the
+    // high half, as an index into its own table: a wild pointer in
+    // __constant__ memory and CUDA_ERROR_ILLEGAL_ADDRESS on the first read.
+    //
+    // Translated in place into a member so the bytes outlive the call, and a
+    // blob that does not parse is passed through rather than mangled -- a
+    // backend may one day take something that is not an Args.
+    const void* forward = args;
+    size_t      forwardBytes = bytes;
+    if (const Args::View view = Args::read(args, bytes);
+        view.valid && view.bufferCount > 0) {
+        translated_.assign(static_cast<const unsigned char*>(args),
+                           static_cast<const unsigned char*>(args) + bytes);
+        auto* handles = reinterpret_cast<BufferId*>(
+            translated_.data() + 2 * sizeof(uint32_t));
+        for (uint32_t i = 0; i < view.bufferCount; ++i) {
+            handles[i] = nativeHandle(handles[i]);
+        }
+        forward = translated_.data();
+        forwardBytes = translated_.size();
+    }
+
     // The counter moves first. A buffer released after this call belongs to
     // this submission and not the one before it, which is the difference
     // between waiting for the work that touched it and waiting for the work
     // that did not.
     ++submitted_;
-    native_->dispatch(kernel, grid, args, bytes);
+    native_->dispatch(kernel, grid, forward, forwardBytes);
 }
 
 void PooledDevice::sync() {

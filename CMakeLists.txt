@@ -74,7 +74,12 @@ if(GPE_SOURCES)
             "-framework Metal" "-framework Foundation" "-framework QuartzCore")
     elseif(GPE_BACKEND STREQUAL "CUDA")
         find_package(CUDAToolkit REQUIRED)
-        target_link_libraries(gpe PRIVATE CUDA::cudart)
+        # The driver API, not the runtime: the kernels are PTX in a blob and
+        # loading a module from memory is cuModuleLoadData. The runtime API's
+        # <<<>>> launch needs the kernel compiled into this binary by nvcc,
+        # which is the thing embedding a blob is instead of.
+        target_link_libraries(gpe PRIVATE CUDA::cuda_driver)
+        target_include_directories(gpe PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     endif()
 else()
     target_include_directories(gpe INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)

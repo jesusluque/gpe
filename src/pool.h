@@ -169,6 +169,9 @@ private:
     std::vector<std::vector<uint32_t>> freeByBucket_;
     std::deque<Retiring>               retiring_;
     std::vector<uint32_t>              recycledSlots_;   ///< slot indices to reuse
+    /// A dispatch's argument blob with its handles translated to native ones.
+    /// A member rather than a local: the backend may copy it asynchronously.
+    std::vector<unsigned char>         translated_;
 
     /// Written by the render thread, read by it too. The completion thread only
     /// ever writes `completed_`.
