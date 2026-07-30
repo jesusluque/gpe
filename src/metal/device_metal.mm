@@ -236,9 +236,14 @@ public:
         const uint64_t submission = ++submitted_;
         // The std::function overload, named explicitly: metal-cpp also takes an
         // Objective-C block and a lambda converts to either.
-        const MTL::HandlerFunction handler = [this, submission](MTL::CommandBuffer*) {
-            reportCompleted(submission);
-        };
+        const MTL::HandlerFunction handler =
+            [this, submission](MTL::CommandBuffer* done) {
+                // The device's own clock, read off the command buffer. Seconds
+                // since an arbitrary epoch, so only the difference means
+                // anything -- which is all that is wanted.
+                const double seconds = done->GPUEndTime() - done->GPUStartTime();
+                reportCompleted(submission, seconds * 1000.0);
+            };
         commands->addCompletedHandler(handler);
 
         // Returns without waiting. `sync` is what waits, and the counter above

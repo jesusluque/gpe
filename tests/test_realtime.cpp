@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "arena.h"
+#include "completion.h"
 #include "gpe/args.h"
 #include "gpe/device.h"
 #include "pool.h"
@@ -56,6 +57,10 @@ int main() {
     const char* which =
         native->backend() == Device::Backend::CUDA ? "CUDA" : "Metal";
 
+    // Kept before the pool takes ownership: this is the backend's own timing,
+    // and the pool deliberately knows nothing about it.
+    const auto* reporter = dynamic_cast<const CompletionReporting*>(native.get());
+
     PooledDevice device(std::move(native), size_t{4} << 30);
     const KernelId scale = device.load("scale");
     check(scale != kInvalidKernel, "the scale kernel loads");
@@ -71,9 +76,6 @@ int main() {
     if (arenas.capacity() != kImagesPerFrame) {
         return 1;
     }
-
-    const Args::View unusedWarning{};
-    (void)unusedWarning;
 
     // Warm up. The first dispatch of a kernel pays for the driver's JIT of the
     // PTX and for whatever Metal does to a pipeline the first time; measuring
@@ -97,7 +99,9 @@ int main() {
     // synchronise: `begin` waits on the watermark if it has to, `image` is an
     // index, `dispatch` returns without waiting, and `end` records a number.
     std::vector<double> frameMs;
+    std::vector<double> gpuMs;
     frameMs.reserve(kFrames);
+    gpuMs.reserve(kFrames);
     const auto period = std::chrono::duration<double>(1.0 / kTargetFps);
     const auto start = Clock::now();
     int missed = 0;
@@ -119,6 +123,14 @@ int main() {
 
         const auto frameEnd = Clock::now();
         frameMs.push_back(Ms(frameEnd - frameStart).count());
+        // What the device says it spent, read off whichever completion has
+        // landed by now. Two frames behind, which is what a three-deep pipeline
+        // means -- and still the only honest measure of the work.
+        if (reporter != nullptr) {
+            if (const double ms = reporter->lastGpuMs(); ms > 0.0) {
+                gpuMs.push_back(ms);
+            }
+        }
         if (frameEnd > deadline) {
             ++missed;
         } else {
@@ -136,10 +148,29 @@ int main() {
     const double worst = frameMs.back();
 
     std::printf(
-        "test_realtime: %s  %d frames at %.0f fps  missed %d  "
-        "p50 %.3f ms  p99 %.3f ms  worst %.3f ms  stalls %llu\n",
-        which, kFrames, kTargetFps, missed, p50, p99, worst,
-        static_cast<unsigned long long>(arenas.stalls() - stallsAfterWarmup));
+        "test_realtime: %s  %d frames at %.0f fps  missed %d  stalls %llu\n"
+        "  cpu (queueing):  p50 %.3f ms  p99 %.3f ms  worst %.3f ms\n",
+        which, kFrames, kTargetFps, missed,
+        static_cast<unsigned long long>(arenas.stalls() - stallsAfterWarmup),
+        p50, p99, worst);
+
+    if (!gpuMs.empty()) {
+        std::sort(gpuMs.begin(), gpuMs.end());
+        std::printf(
+            "  gpu (the work):  p50 %.3f ms  p99 %.3f ms  worst %.3f ms"
+            "  (%zu samples)\n",
+            gpuMs[gpuMs.size() / 2],
+            gpuMs[static_cast<size_t>(gpuMs.size() * 0.99)], gpuMs.back(),
+            gpuMs.size());
+        // The budget is the frame period, and it is the GPU that has to fit in
+        // it. A CPU-side number that fits while the device does not is exactly
+        // the mistake this measurement exists to prevent.
+        check(gpuMs[static_cast<size_t>(gpuMs.size() * 0.99)] <
+                  1000.0 / kTargetFps,
+              "the device finishes a frame inside the frame period");
+    } else {
+        std::puts("  gpu: not measured by this backend");
+    }
 
     check(missed == 0, "no frame missed its deadline");
 

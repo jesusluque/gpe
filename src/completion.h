@@ -34,11 +34,25 @@ public:
         return completed_.load(std::memory_order_acquire);
     }
 
+    /// How long the device spent on the most recent submission it finished, in
+    /// milliseconds. Zero from a backend that does not measure.
+    ///
+    /// Measured by the device, not by a clock on this side. The CPU clock round
+    /// a dispatch measures how long it took to *queue* the work -- which on a
+    /// pipeline that is working is a fraction of the work itself, and is the
+    /// number that looks best exactly when the GPU is furthest behind.
+    [[nodiscard]] double lastGpuMs() const noexcept {
+        return gpuMs_.load(std::memory_order_relaxed);
+    }
+
 protected:
     /// Called from the driver's completion handler, on the driver's thread.
     /// Stores and returns; no locks, no allocation, nothing that could call
     /// back into the engine.
-    void reportCompleted(uint64_t submission) noexcept {
+    void reportCompleted(uint64_t submission, double gpuMs = 0.0) noexcept {
+        if (gpuMs > 0.0) {
+            gpuMs_.store(gpuMs, std::memory_order_relaxed);
+        }
         // Monotonic even if handlers arrive out of order, which they may:
         // two command buffers can finish in either order and the pool's rule is
         // "everything up to N", not "N".
@@ -51,6 +65,7 @@ protected:
     }
 
     std::atomic<uint64_t> completed_{0};
+    std::atomic<double>   gpuMs_{0.0};
 };
 
 }   // namespace gpe

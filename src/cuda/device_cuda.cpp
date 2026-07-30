@@ -70,6 +70,14 @@ public:
             for (void* const pinned : pinned_) {
                 cuMemFreeHost(pinned);
             }
+            for (const Timing& timing : timings_) {
+                if (timing.start != nullptr) {
+                    cuEventDestroy(timing.start);
+                }
+                if (timing.stop != nullptr) {
+                    cuEventDestroy(timing.stop);
+                }
+            }
             for (const CUmodule module : modules_) {
                 cuModuleUnload(module);
             }
@@ -102,6 +110,12 @@ public:
         // allocated would be a dispatch that synchronises.
         for (CUdeviceptr& staging : staging_) {
             if (!ok(cuMemAlloc(&staging, kStagingBytes), "cuMemAlloc(staging)")) {
+                return false;
+            }
+        }
+        for (Timing& timing : timings_) {
+            if (!ok(cuEventCreate(&timing.start, CU_EVENT_DEFAULT), "eventCreate") ||
+                !ok(cuEventCreate(&timing.stop, CU_EVENT_DEFAULT), "eventCreate")) {
                 return false;
             }
         }
@@ -281,6 +295,8 @@ public:
         const auto groups = [](uint32_t threads, uint32_t size) {
             return (threads + size - 1) / size;
         };
+        (void)cuEventRecord(timings_[timingAt_].start, stream_);
+
         // No kernel parameters at all: Slang puts everything in the
         // __constant__ block, so the launch passes nothing.
         (void)ok(cuLaunchKernel(kernel.function, groups(grid.x, kGroupX),
@@ -288,6 +304,21 @@ public:
                                 kGroupX, kGroupY, 1, 0, stream_, nullptr,
                                 nullptr),
                  "cuLaunchKernel");
+
+        // Bracketed by events, so the device times itself.
+        //
+        // Read later, never here: cuEventElapsedTime blocks until the pair has
+        // happened, and blocking is the one thing a dispatch may not do. The
+        // ring is harvested on the way into the *next* dispatch, by which time
+        // the older pairs have long finished.
+        harvestTimings();
+        Timing& timing = timings_[timingAt_];
+        timingAt_ = (timingAt_ + 1) % kTimingSlots;
+        if (timing.pending) {
+            timing.pending = false;   // dropped: the ring wrapped before it was read
+        }
+        (void)cuEventRecord(timing.stop, stream_);
+        timing.pending = true;
 
         // And a host function behind it, which the driver runs when the stream
         // reaches it -- Metal's completion handler, spelled differently.
@@ -309,6 +340,12 @@ private:
         CUdeviceptr ptr = 0;
         size_t      bytes = 0;
     };
+    struct Timing {
+        CUevent start = nullptr;
+        CUevent stop = nullptr;
+        bool    pending = false;
+    };
+
     struct Kernel {
         std::string name;
         CUfunction  function = nullptr;
@@ -326,6 +363,25 @@ private:
     /// uniforms of one still in flight.
     static constexpr size_t kStagingBytes = 4096;
     static constexpr int    kStagingSlots = 4;
+    /// Deeper than the three-frame pipeline, so a pair is always finished long
+    /// before its slot comes round again.
+    static constexpr int    kTimingSlots = 8;
+
+    /// Reads any event pair the device has finished with. Never waits:
+    /// cuEventQuery is a poll, and a pair that is not ready is left for the
+    /// next dispatch to find.
+    void harvestTimings() {
+        for (Timing& timing : timings_) {
+            if (!timing.pending || cuEventQuery(timing.stop) != CUDA_SUCCESS) {
+                continue;
+            }
+            float ms = 0.0f;
+            if (cuEventElapsedTime(&ms, timing.start, timing.stop) == CUDA_SUCCESS) {
+                gpuMs_.store(ms, std::memory_order_relaxed);
+            }
+            timing.pending = false;
+        }
+    }
 
     static void CUDA_CB onCompleted(void* userData) {
         auto* self = static_cast<CudaDevice*>(userData);
@@ -360,6 +416,8 @@ private:
     /// once per dispatch and nothing else does.
     uint64_t              submitted_ = 0;
     std::atomic<uint64_t> finished_{0};
+    Timing                timings_[kTimingSlots]{};
+    int                   timingAt_ = 0;
 
     std::vector<Allocation> buffers_;
     std::vector<Kernel>     kernels_;
