@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "completion.h"
+#include "hostring.h"
 #include "gpe/args.h"
 #include "gpe/device.h"
 #include "gpe_kernels.h"
@@ -59,7 +60,9 @@ bool ok(CUresult result, const char* what) {
     return false;
 }
 
-class CudaDevice final : public Device, public CompletionReporting {
+class CudaDevice final : public Device,
+                        public CompletionReporting,
+                        public HostStaging {
 public:
     ~CudaDevice() override {
         if (context_ != nullptr) {
@@ -188,6 +191,21 @@ public:
         if (a == nullptr || src == nullptr) {
             return;
         }
+        // Already pinned? Then there is nothing to stage.
+        //
+        // The decode ring hands out memory this backend allocated, so the bytes
+        // are somewhere the driver can DMA out of directly. Copying them into
+        // another pinned buffer first would be 33 MB of memcpy per frame to
+        // arrive exactly where they already were.
+        if (isHostBlock(src, bytes)) {
+            if (ok(cuMemcpyHtoDAsync(a->ptr, src, bytes, copyStream_),
+                   "upload HtoDAsync(direct)")) {
+                (void)ok(cuEventRecord(copyDone_, copyStream_), "copyEventRecord");
+                uploadPending_ = true;
+            }
+            return;
+        }
+
         // Through pinned memory the engine owns, on the copy stream.
         //
         // `src` belongs to the caller, who may destroy it the moment this
@@ -380,6 +398,29 @@ public:
                  "cuLaunchHostFunc");
     }
 
+    // --- HostStaging -------------------------------------------------------
+
+    [[nodiscard]] void* allocHost(size_t bytes) override {
+        void* memory = nullptr;
+        if (!ok(cuMemAllocHost(&memory, bytes), "cuMemAllocHost(ring)")) {
+            return nullptr;
+        }
+        hostBlocks_.push_back(HostBlock{memory, bytes});
+        return memory;
+    }
+    void freeHost(void* memory) override {
+        if (memory == nullptr) {
+            return;
+        }
+        for (auto it = hostBlocks_.begin(); it != hostBlocks_.end(); ++it) {
+            if (it->memory == memory) {
+                hostBlocks_.erase(it);
+                break;
+            }
+        }
+        cuMemFreeHost(memory);
+    }
+
     void sync() override {
         // Both, because a caller asking for everything to be finished means
         // both the work and the transfers.
@@ -392,6 +433,23 @@ private:
         CUdeviceptr ptr = 0;
         size_t      bytes = 0;
     };
+    struct HostBlock {
+        void*  memory = nullptr;
+        size_t bytes = 0;
+    };
+
+    /// True if `src` lies wholly inside memory this backend page-locked.
+    [[nodiscard]] bool isHostBlock(const void* src, size_t bytes) const {
+        const auto* p = static_cast<const unsigned char*>(src);
+        for (const HostBlock& block : hostBlocks_) {
+            const auto* start = static_cast<const unsigned char*>(block.memory);
+            if (p >= start && p + bytes <= start + block.bytes) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     struct UploadSlot {
         void*  host = nullptr;
         size_t bytes = 0;
@@ -507,6 +565,7 @@ private:
     CUstream              copyStream_ = nullptr;
     CUevent               copyDone_ = nullptr;
     bool                  uploadPending_ = false;
+    std::vector<HostBlock> hostBlocks_;
     UploadSlot            uploads_[kUploadSlots]{};
     int                   uploadAt_ = 0;
 

@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "completion.h"
+#include "hostring.h"
 #include "gpe/args.h"
 #include "gpe/device.h"
 #include "gpe_kernels.h"
@@ -46,7 +47,9 @@
 namespace gpe {
 namespace {
 
-class MetalDevice final : public Device, public CompletionReporting {
+class MetalDevice final : public Device,
+                         public CompletionReporting,
+                         public HostStaging {
 public:
     ~MetalDevice() override {
         for (MTL::Buffer* buffer : buffers_) {
@@ -56,6 +59,9 @@ public:
         }
         for (const Kernel& kernel : kernels_) {
             kernel.pipeline->release();
+        }
+        for (const HostBuffer& host : hostBuffers_) {
+            host.buffer->release();
         }
         for (const Staging& slot : uploads_) {
             if (slot.buffer != nullptr) {
@@ -125,6 +131,31 @@ public:
         if (slot == nullptr || src == nullptr || bytes == 0) {
             return;
         }
+        // Already one of ours? Then blit straight from it.
+        //
+        // The decode ring hands out the contents of a shared MTLBuffer this
+        // backend made, so the bytes are already where the GPU can read them.
+        // Copying them into a second shared buffer first would be 33 MB of
+        // memcpy per frame to arrive where they already were.
+        if (MTL::Buffer* source = hostBufferFor(src, bytes); source != nullptr) {
+            MTL::CommandBuffer* direct = blitQueue_->commandBuffer();
+            MTL::BlitCommandEncoder* encoder = direct->blitCommandEncoder();
+            const size_t offset =
+                static_cast<const unsigned char*>(src) -
+                static_cast<const unsigned char*>(source->contents());
+            encoder->copyFromBuffer(source, offset, *slot, 0, bytes);
+            encoder->endEncoding();
+            direct->encodeSignalEvent(uploadEvent_, ++uploadValue_);
+            direct->commit();
+            if (lastBlit_ != nullptr) {
+                lastBlit_->release();
+            }
+            direct->retain();
+            lastBlit_ = direct;
+            uploadPending_ = true;
+            return;
+        }
+
         // Through shared memory the engine owns, on the blit queue.
         //
         // `src` belongs to the caller, who may destroy it the moment this
@@ -294,6 +325,33 @@ public:
         previous_ = commands;
     }
 
+    // --- HostStaging -------------------------------------------------------
+    //
+    // A shared MTLBuffer, handed out as its contents pointer. On unified memory
+    // there is no separate host allocation to pin: a shared buffer already is
+    // memory both sides can reach, which is the same thing this interface is
+    // for on CUDA and arrived at from the other direction.
+
+    [[nodiscard]] void* allocHost(size_t bytes) override {
+        MTL::Buffer* buffer =
+            device_->newBuffer(bytes, MTL::ResourceStorageModeShared);
+        if (buffer == nullptr) {
+            return nullptr;
+        }
+        void* contents = buffer->contents();
+        hostBuffers_.push_back(HostBuffer{contents, buffer});
+        return contents;
+    }
+    void freeHost(void* memory) override {
+        for (auto it = hostBuffers_.begin(); it != hostBuffers_.end(); ++it) {
+            if (it->contents == memory) {
+                it->buffer->release();
+                hostBuffers_.erase(it);
+                return;
+            }
+        }
+    }
+
     void sync() override {
         // Both queues: a caller asking for everything to be finished means the
         // transfers as well as the work.
@@ -307,6 +365,11 @@ public:
 
 private:
     struct Staging {
+        MTL::Buffer* buffer = nullptr;
+    };
+
+    struct HostBuffer {
+        void*        contents = nullptr;
         MTL::Buffer* buffer = nullptr;
     };
 
@@ -327,6 +390,18 @@ private:
     /// Grown on demand and never shrunk. It grows during prepare(), when the
     /// first uploads set the size; every frame of a playback uploads the same
     /// shape and finds it already there.
+    /// The shared buffer `src` lives in, if this backend made it.
+    [[nodiscard]] MTL::Buffer* hostBufferFor(const void* src, size_t bytes) const {
+        const auto* p = static_cast<const unsigned char*>(src);
+        for (const HostBuffer& host : hostBuffers_) {
+            const auto* start = static_cast<const unsigned char*>(host.contents);
+            if (p >= start && p + bytes <= start + host.buffer->length()) {
+                return host.buffer;
+            }
+        }
+        return nullptr;
+    }
+
     [[nodiscard]] MTL::Buffer* uploadStaging(size_t bytes) {
         Staging& slot = uploads_[uploadAt_];
         uploadAt_ = (uploadAt_ + 1) % kUploadSlots;
@@ -373,6 +448,7 @@ private:
     /// increment once per dispatch and nothing else.
     uint64_t            submitted_ = 0;
 
+    std::vector<HostBuffer>   hostBuffers_;
     std::vector<MTL::Buffer*> buffers_;
     std::vector<Kernel>       kernels_;
 };

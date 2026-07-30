@@ -13,12 +13,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "arena.h"
 #include "completion.h"
+#include "hostring.h"
 #include "gpe/args.h"
 #include "gpe/device.h"
 #include "pool.h"
@@ -68,6 +70,18 @@ int main() {
         return 1;
     }
 
+    // The decode side: host memory the backend can DMA out of, in a ring the
+    // producer owns by index. Without this the test uploaded nothing and
+    // measured a pipeline with the transfers taken out -- which is exactly the
+    // half the separate copy queue exists for.
+    auto* staging = const_cast<HostStaging*>(
+        dynamic_cast<const HostStaging*>(reporter));
+    HostRing decoded(FrameArenas::kSlots + 1,
+                     size_t{kWidth} * size_t{kHeight} * 16, staging);
+    check(decoded.count() == FrameArenas::kSlots + 1,
+          "the decode ring reserved its slots");
+    check(staging != nullptr, "and the backend gave page-locked memory for it");
+
     FrameArenas arenas(device);
     // Everything the chain will ever need, taken now. If it does not fit, this
     // is where playback is refused -- not at frame 173.
@@ -105,6 +119,7 @@ int main() {
     const auto period = std::chrono::duration<double>(1.0 / kTargetFps);
     const auto start = Clock::now();
     int missed = 0;
+    int starved = 0;
 
     for (int f = 0; f < kFrames; ++f) {
         const auto deadline = start + std::chrono::duration_cast<Clock::duration>(
@@ -112,8 +127,23 @@ int main() {
         const auto frameStart = Clock::now();
 
         arenas.begin(static_cast<uint64_t>(f) + 3);
-        const Image src = arenas.image();
-        const Image dst = arenas.image();
+        const FrameArenas::FrameContext frame = arenas.context();
+        const Image src = frame.input;
+        const Image dst = frame.output;
+
+        // Stand in for a decoder: take the slot whose turn it is, fill it, hand
+        // it over. It never touches the device and never waits on it -- it asks
+        // the watermark whether the slot has come back and is told.
+        const uint64_t retired =
+            reporter != nullptr ? reporter->completedSubmissions() : 0;
+        if (void* plate = decoded.acquire(retired); plate != nullptr) {
+            std::memset(plate, f % 251, decoded.bytes());
+            device.upload(src.buf, plate, decoded.bytes());
+            decoded.commit(device.submission() + 1);
+        } else {
+            ++starved;
+        }
+
         Args args;
         args.buffer(src.buf).buffer(dst.buf).uniforms(ScaleUniforms{
             kWidth, kHeight, kWidth,
@@ -173,6 +203,13 @@ int main() {
     }
 
     check(missed == 0, "no frame missed its deadline");
+    // Back-pressure, reported rather than hidden. A ring one deeper than the
+    // pipeline should never be empty when the pipeline is keeping up; if it is,
+    // the transfers are the thing that is behind and that is worth knowing
+    // before anybody goes looking at the kernel.
+    std::printf("  decode ring: %llu plates handed over, %d frames starved\n",
+                static_cast<unsigned long long>(decoded.committed()), starved);
+    check(starved == 0, "and the decode ring never ran dry");
 
     // The pool learned what had finished from the backend, not from a wait.
     //
