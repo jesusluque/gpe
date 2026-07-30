@@ -26,6 +26,22 @@
 // into one allocation, which at one image per node and 32 MiB buckets is not
 // where the memory goes.
 //
+// NOBODY OWNS A BUFFER
+//
+// A stage does not allocate and does not release. It is handed a FrameContext
+// with Image views over the slot's pre-reserved arena, reads and writes where
+// it is told, and that is all. Ownership belongs to the *slot*, not to any
+// stage, and the submission watermark governs it: before a slot is used again,
+// the work it ended on must have retired.
+//
+// This is why a BufferId never crosses a thread boundary. The decode side hands
+// over host memory by index in a ring it pre-reserved, the GPU side hands over
+// Images by index in an arena it pre-reserved, and neither ever transfers a
+// handle -- only the right to use a slot for a window. Overlap between copy and
+// compute comes from separate streams or command queues, not from separate
+// threads: a copy issued on one queue and a kernel on another overlap even when
+// the same thread issued both.
+//
 // THREE SLOTS
 //
 // A frame's buffers cannot be reused until the GPU has finished reading them,
@@ -84,6 +100,30 @@ public:
 
     /// Ends the frame, recording what the slot has to outlive.
     void end();
+
+    /// What a stage is handed.
+    ///
+    /// Views, not ownership: every Image in here belongs to the slot and is
+    /// valid until the frame ends. A stage that called release() on one of them
+    /// would be handing back a buffer the arena still believes it has, which is
+    /// why no stage is given the device at all.
+    struct FrameContext {
+        uint64_t   frame = 0;
+        uint32_t   slot = 0;
+        Submission submission = 0;
+        Image      input;
+        Image      output;
+        /// Anything the chain needs between the two, in reservation order.
+        const Image* scratch = nullptr;
+        size_t       scratchCount = 0;
+    };
+
+    /// The context for the frame `begin()` started.
+    ///
+    /// Hands out the first reserved image as `input`, the second as `output`
+    /// and the rest as scratch, which is the shape of every chain that reads
+    /// one picture and writes one.
+    [[nodiscard]] FrameContext context();
 
     /// Where the pipeline is, for a caller deciding whether it is keeping up.
     [[nodiscard]] uint64_t frame() const noexcept { return frame_; }

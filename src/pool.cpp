@@ -78,6 +78,23 @@ PooledDevice::~PooledDevice() {
     }
 }
 
+void PooledDevice::checkThread(const char* where) const {
+    const std::thread::id here = std::this_thread::get_id();
+    if (owner_ == std::thread::id{}) {
+        owner_ = here;
+        return;
+    }
+    if (owner_ == here || complainedAboutThread_) {
+        return;
+    }
+    complainedAboutThread_ = true;
+    std::fprintf(stderr,
+                 "gpe: the pool was used from a second thread (%s). A BufferId "
+                 "means nothing outside the pool that issued it; hand work "
+                 "between threads as an index into a pre-reserved ring.\n",
+                 where);
+}
+
 Device::Backend PooledDevice::backend() const { return native_->backend(); }
 
 PooledDevice::Slot* PooledDevice::resolve(BufferId id) noexcept {
@@ -171,6 +188,7 @@ bool PooledDevice::makeRoom(size_t bytes) {
 }
 
 BufferId PooledDevice::alloc(size_t bytes) {
+    checkThread("alloc");
     if (bytes == 0) {
         return kInvalidBuffer;
     }
@@ -222,6 +240,7 @@ BufferId PooledDevice::alloc(size_t bytes) {
 }
 
 void PooledDevice::release(BufferId id) {
+    checkThread("release");
     Slot* slot = resolve(id);
     if (slot == nullptr) {
         return;   // stale or never ours; releasing twice is not a crash
@@ -293,11 +312,13 @@ void PooledDevice::dispatch(KernelId kernel, Grid grid, const void* args,
     // this submission and not the one before it, which is the difference
     // between waiting for the work that touched it and waiting for the work
     // that did not.
+    checkThread("dispatch");
     ++submitted_;
     native_->dispatch(kernel, grid, forward, forwardBytes);
 }
 
 void PooledDevice::sync() {
+    checkThread("sync");
     native_->sync();
     // A backend with completion handlers publishes this itself; doing it here
     // too costs nothing and keeps a backend that has none -- or a test -- from

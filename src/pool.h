@@ -30,6 +30,20 @@
 // asking the driver.
 //
 // `sync()` is likewise a prepare-time call. Inside a frame it is forbidden.
+//
+// ONE THREAD
+//
+// A BufferId is a slot and a generation in *this* pool's table and means
+// nothing anywhere else, so it must never cross a thread boundary. The pool is
+// used from the thread that owns it and no other; where work has to be handed
+// between threads, what crosses is an index into a ring both sides pre-reserved
+// -- host memory on the decode side, arena slots on the device side -- and
+// never a handle.
+//
+// This is an invariant, not a preference, so it is checked: every entry point
+// records the thread that first used the pool and complains once if another
+// one appears. Cheap enough to leave in, because the alternative is a data race
+// that shows up as a wrong picture under load and nowhere else.
 #pragma once
 
 #include <atomic>
@@ -39,6 +53,7 @@
 #include <functional>
 #include <memory>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "completion.h"
@@ -166,6 +181,9 @@ private:
     /// Everything short of failing, in order, until `bytes` will fit.
     [[nodiscard]] bool makeRoom(size_t bytes);
 
+    /// Complains once if the pool is touched from a second thread.
+    void checkThread(const char* where) const;
+
     std::unique_ptr<Device>     native_;
     size_t                      budget_ = 0;
     std::function<bool(size_t)> onPressure_;
@@ -188,6 +206,11 @@ private:
     std::atomic<Submission> completed_{0};
 
     Stats stats_{};
+
+    /// The thread that first used this pool, and whether it has been told about
+    /// a second one. Mutable because the check belongs in const methods too.
+    mutable std::thread::id owner_{};
+    mutable bool            complainedAboutThread_ = false;
 };
 
 }   // namespace gpe

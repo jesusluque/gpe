@@ -99,6 +99,30 @@ Image FrameArenas::image() {
     return slot.images[handed_++];
 }
 
+FrameArenas::FrameContext FrameArenas::context() {
+    FrameContext frame;
+    frame.frame = frame_;
+    frame.slot = static_cast<uint32_t>(current_);
+    frame.submission = device_->submission();
+
+    const std::vector<Image>& images = slots_[current_].images;
+    if (!images.empty()) {
+        frame.input = images[0];
+    }
+    if (images.size() > 1) {
+        frame.output = images[1];
+    }
+    if (images.size() > 2) {
+        frame.scratch = images.data() + 2;
+        frame.scratchCount = images.size() - 2;
+    }
+    // Everything is handed out at once, so `image()` and `context()` are two
+    // ways of asking the same question and a caller that mixes them does not
+    // get the same buffer twice.
+    handed_ = images.size();
+    return frame;
+}
+
 void FrameArenas::end() {
     // Whatever was queued during this frame is what the slot has to outlive.
     // Recorded on the way out, so the next time round this slot the wait is for
