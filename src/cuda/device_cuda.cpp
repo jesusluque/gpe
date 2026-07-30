@@ -70,6 +70,14 @@ public:
             for (void* const pinned : pinned_) {
                 cuMemFreeHost(pinned);
             }
+            for (const UploadSlot& slot : uploads_) {
+                if (slot.host != nullptr) {
+                    cuMemFreeHost(slot.host);
+                }
+            }
+            if (copyDone_ != nullptr) {
+                cuEventDestroy(copyDone_);
+            }
             for (const Timing& timing : timings_) {
                 if (timing.start != nullptr) {
                     cuEventDestroy(timing.start);
@@ -103,6 +111,23 @@ public:
         // make "asynchronous by default" a promise the first library we link
         // against could break.
         if (!ok(cuStreamCreate(&stream_, CU_STREAM_NON_BLOCKING), "streamCreate")) {
+            return false;
+        }
+        // A second stream for transfers.
+        //
+        // This is where the overlap comes from, and it is worth being precise
+        // about why: an upload on one stream and a kernel on another run at the
+        // same time because the copy engine and the SMs are different hardware,
+        // not because two threads issued them. One thread issuing to two
+        // streams gets the whole of the benefit.
+        //
+        // They are ordered where it matters and nowhere else: an event recorded
+        // after an upload, waited on before the next dispatch, so a kernel
+        // never reads a buffer whose bytes are still in flight.
+        if (!ok(cuStreamCreate(&copyStream_, CU_STREAM_NON_BLOCKING),
+                "copyStreamCreate") ||
+            !ok(cuEventCreate(&copyDone_, CU_EVENT_DISABLE_TIMING),
+                "copyEventCreate")) {
             return false;
         }
         // Uniforms live in device memory because the generated code reaches
@@ -163,15 +188,28 @@ public:
         if (a == nullptr || src == nullptr) {
             return;
         }
-        // Synchronous, and deliberately.
+        // Through pinned memory the engine owns, on the copy stream.
         //
-        // An async copy would read `src` when the stream got to it, and `src`
-        // belongs to the caller -- who has every right to destroy it the moment
-        // this returns. Overlapping uploads with compute is worth doing and is
-        // its own piece of work: it needs the caller's bytes in pinned memory
-        // the engine owns, which is a change to how a client hands over an
-        // image, not a change to this line.
-        (void)ok(cuMemcpyHtoD(a->ptr, src, bytes), "HtoD");
+        // `src` belongs to the caller, who may destroy it the moment this
+        // returns, so the bytes are taken now -- a memcpy, which is fast and
+        // synchronous -- and the DMA out of pinned memory is what overlaps.
+        // Copying straight from the caller's pointer asynchronously would read
+        // a buffer that no longer exists, which is a bug this file has already
+        // made once.
+        void* staging = uploadStaging(bytes);
+        if (staging == nullptr) {
+            // No pinned buffer to be had: correct beats fast.
+            (void)ok(cuMemcpyHtoD(a->ptr, src, bytes), "HtoD");
+            return;
+        }
+        std::memcpy(staging, src, bytes);
+        if (!ok(cuMemcpyHtoDAsync(a->ptr, staging, bytes, copyStream_),
+                "upload HtoDAsync")) {
+            return;
+        }
+        // Recorded on the copy stream; the next dispatch waits on it.
+        (void)ok(cuEventRecord(copyDone_, copyStream_), "copyEventRecord");
+        uploadPending_ = true;
     }
 
     void download(void* dst, BufferId id, size_t bytes) override {
@@ -295,6 +333,15 @@ public:
         const auto groups = [](uint32_t threads, uint32_t size) {
             return (threads + size - 1) / size;
         };
+        // Compute waits for whatever was uploaded since the last dispatch, and
+        // for nothing else. Without this the kernel could read a buffer whose
+        // DMA is still running; with a full synchronisation instead, there
+        // would be no overlap left to have.
+        if (uploadPending_) {
+            (void)ok(cuStreamWaitEvent(stream_, copyDone_, 0), "streamWaitEvent");
+            uploadPending_ = false;
+        }
+
         (void)cuEventRecord(timings_[timingAt_].start, stream_);
 
         // No kernel parameters at all: Slang puts everything in the
@@ -333,13 +380,23 @@ public:
                  "cuLaunchHostFunc");
     }
 
-    void sync() override { (void)ok(cuStreamSynchronize(stream_), "streamSync"); }
+    void sync() override {
+        // Both, because a caller asking for everything to be finished means
+        // both the work and the transfers.
+        (void)ok(cuStreamSynchronize(copyStream_), "copyStreamSync");
+        (void)ok(cuStreamSynchronize(stream_), "streamSync");
+    }
 
 private:
     struct Allocation {
         CUdeviceptr ptr = 0;
         size_t      bytes = 0;
     };
+    struct UploadSlot {
+        void*  host = nullptr;
+        size_t bytes = 0;
+    };
+
     struct Timing {
         CUevent start = nullptr;
         CUevent stop = nullptr;
@@ -366,6 +423,35 @@ private:
     /// Deeper than the three-frame pipeline, so a pair is always finished long
     /// before its slot comes round again.
     static constexpr int    kTimingSlots = 8;
+    /// Matches the three-frame pipeline, plus one so a slot is never reused
+    /// while its DMA is still running.
+    static constexpr int    kUploadSlots = 4;
+
+    /// A pinned host buffer of at least `bytes`, from a small ring.
+    ///
+    /// Grown on demand and never shrunk. It grows during prepare(), when the
+    /// first frame's uploads set the size; a frame that uploads the same shape
+    /// as the one before -- which is every frame of a playback -- finds it
+    /// already there and allocates nothing.
+    [[nodiscard]] void* uploadStaging(size_t bytes) {
+        UploadSlot& slot = uploads_[uploadAt_];
+        uploadAt_ = (uploadAt_ + 1) % kUploadSlots;
+        if (slot.bytes < bytes) {
+            if (slot.host != nullptr) {
+                // In flight or not, this is prepare-time: waiting here is
+                // allowed and freeing pinned memory a DMA is reading is not.
+                (void)cuStreamSynchronize(copyStream_);
+                cuMemFreeHost(slot.host);
+                slot.host = nullptr;
+                slot.bytes = 0;
+            }
+            if (!ok(cuMemAllocHost(&slot.host, bytes), "cuMemAllocHost(upload)")) {
+                return nullptr;
+            }
+            slot.bytes = bytes;
+        }
+        return slot.host;
+    }
 
     /// Reads any event pair the device has finished with. Never waits:
     /// cuEventQuery is a poll, and a pair that is not ready is left for the
@@ -418,6 +504,11 @@ private:
     std::atomic<uint64_t> finished_{0};
     Timing                timings_[kTimingSlots]{};
     int                   timingAt_ = 0;
+    CUstream              copyStream_ = nullptr;
+    CUevent               copyDone_ = nullptr;
+    bool                  uploadPending_ = false;
+    UploadSlot            uploads_[kUploadSlots]{};
+    int                   uploadAt_ = 0;
 
     std::vector<Allocation> buffers_;
     std::vector<Kernel>     kernels_;

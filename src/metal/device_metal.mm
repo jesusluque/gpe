@@ -57,6 +57,17 @@ public:
         for (const Kernel& kernel : kernels_) {
             kernel.pipeline->release();
         }
+        for (const Staging& slot : uploads_) {
+            if (slot.buffer != nullptr) {
+                slot.buffer->release();
+            }
+        }
+        if (uploadEvent_ != nullptr) {
+            uploadEvent_->release();
+        }
+        if (blitQueue_ != nullptr) {
+            blitQueue_->release();
+        }
         if (queue_ != nullptr) {
             queue_->release();
         }
@@ -71,7 +82,15 @@ public:
             return false;
         }
         queue_ = device_->newCommandQueue();
-        return queue_ != nullptr;
+        // A second queue for transfers, and an event to order them against the
+        // first. Same reason as the CUDA copy stream: a blit and a kernel on
+        // two queues run at once because they are different hardware, not
+        // because two threads issued them, so one thread issuing to two queues
+        // gets the whole of the benefit.
+        blitQueue_ = device_->newCommandQueue();
+        uploadEvent_ = device_->newEvent();
+        return queue_ != nullptr && blitQueue_ != nullptr &&
+               uploadEvent_ != nullptr;
     }
 
     [[nodiscard]] Backend backend() const override { return Backend::Metal; }
@@ -106,21 +125,32 @@ public:
         if (slot == nullptr || src == nullptr || bytes == 0) {
             return;
         }
-        // Through a temporary shared buffer and a blit. Synchronous for the
-        // same reason the CUDA side is: `src` belongs to the caller, who may
-        // destroy it the moment this returns.
-        MTL::Buffer* staging =
-            device_->newBuffer(src, bytes, MTL::ResourceStorageModeShared);
+        // Through shared memory the engine owns, on the blit queue.
+        //
+        // `src` belongs to the caller, who may destroy it the moment this
+        // returns, so the bytes are taken now with a memcpy and the blit out of
+        // the staging buffer is what overlaps. A staging buffer allocated per
+        // call and released here would also have to be waited for, which is
+        // what made this synchronous before.
+        MTL::Buffer* staging = uploadStaging(bytes);
         if (staging == nullptr) {
             return;
         }
-        MTL::CommandBuffer* commands = queue_->commandBuffer();
+        std::memcpy(staging->contents(), src, bytes);
+
+        MTL::CommandBuffer* commands = blitQueue_->commandBuffer();
         MTL::BlitCommandEncoder* blit = commands->blitCommandEncoder();
         blit->copyFromBuffer(staging, 0, *slot, 0, bytes);
         blit->endEncoding();
+        // Signalled here, waited for by the next dispatch and by nothing else.
+        commands->encodeSignalEvent(uploadEvent_, ++uploadValue_);
         commands->commit();
-        commands->waitUntilCompleted();
-        staging->release();
+        if (lastBlit_ != nullptr) {
+            lastBlit_->release();
+        }
+        commands->retain();
+        lastBlit_ = commands;
+        uploadPending_ = true;
     }
 
     void download(void* dst, BufferId id, size_t bytes) override {
@@ -205,7 +235,15 @@ public:
             return;
         }
 
-        MTL::CommandBuffer*        commands = queue_->commandBuffer();
+        MTL::CommandBuffer* commands = queue_->commandBuffer();
+        // Wait for whatever was uploaded since the last dispatch, and for
+        // nothing else. Without it a kernel could read a buffer whose blit is
+        // still running; with a full wait instead there would be no overlap
+        // left to have.
+        if (uploadPending_) {
+            commands->encodeWait(uploadEvent_, uploadValue_);
+            uploadPending_ = false;
+        }
         MTL::ComputeCommandEncoder* encoder = commands->computeCommandEncoder();
         encoder->setComputePipelineState(kernels_[id - 1].pipeline);
 
@@ -257,12 +295,21 @@ public:
     }
 
     void sync() override {
+        // Both queues: a caller asking for everything to be finished means the
+        // transfers as well as the work.
+        if (lastBlit_ != nullptr) {
+            lastBlit_->waitUntilCompleted();
+        }
         if (previous_ != nullptr) {
             previous_->waitUntilCompleted();
         }
     }
 
 private:
+    struct Staging {
+        MTL::Buffer* buffer = nullptr;
+    };
+
     struct Kernel {
         std::string                name;
         MTL::ComputePipelineState* pipeline = nullptr;
@@ -271,6 +318,32 @@ private:
     /// Matches [numthreads(16, 16, 1)] in the kernels and the CUDA backend.
     static constexpr uint32_t kGroupX = 16;
     static constexpr uint32_t kGroupY = 16;
+    /// Matches the three-frame pipeline, plus one so a slot is never reused
+    /// while its blit is still running.
+    static constexpr int kUploadSlots = 4;
+
+    /// A shared staging buffer of at least `bytes`, from a small ring.
+    ///
+    /// Grown on demand and never shrunk. It grows during prepare(), when the
+    /// first uploads set the size; every frame of a playback uploads the same
+    /// shape and finds it already there.
+    [[nodiscard]] MTL::Buffer* uploadStaging(size_t bytes) {
+        Staging& slot = uploads_[uploadAt_];
+        uploadAt_ = (uploadAt_ + 1) % kUploadSlots;
+        if (slot.buffer != nullptr && slot.buffer->length() >= bytes) {
+            return slot.buffer;
+        }
+        if (slot.buffer != nullptr) {
+            // Prepare-time, so waiting is allowed -- and releasing a buffer a
+            // blit is reading is not.
+            if (lastBlit_ != nullptr) {
+                lastBlit_->waitUntilCompleted();
+            }
+            slot.buffer->release();
+        }
+        slot.buffer = device_->newBuffer(bytes, MTL::ResourceStorageModeShared);
+        return slot.buffer;
+    }
 
     [[nodiscard]] MTL::Buffer** find(BufferId id) {
         if (id == kInvalidBuffer || id > buffers_.size()) {
@@ -288,6 +361,13 @@ private:
 
     MTL::Device*       device_ = nullptr;
     MTL::CommandQueue* queue_ = nullptr;
+    MTL::CommandQueue*  blitQueue_ = nullptr;
+    MTL::Event*         uploadEvent_ = nullptr;
+    uint64_t            uploadValue_ = 0;
+    bool                uploadPending_ = false;
+    MTL::CommandBuffer* lastBlit_ = nullptr;
+    Staging             uploads_[kUploadSlots]{};
+    int                 uploadAt_ = 0;
     MTL::CommandBuffer* previous_ = nullptr;
     /// This backend's own count, which matches the pool's because both
     /// increment once per dispatch and nothing else.

@@ -4,6 +4,7 @@
 // source builds and passes on an M-series Mac through Metal and on an NVIDIA
 // card through CUDA, and if it ever stops doing so on one of them, the thing
 // that broke is the abstraction and not the arithmetic.
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -104,6 +105,42 @@ int main() {
                      pattern[firstWrong] * 2.0f);
     }
     check(wrong == 0, "every pixel is exactly doubled");
+
+    // --- upload and compute are on different queues, and still ordered ------
+    //
+    // One upload followed by one dispatch barely tests the barrier between
+    // them: the copy has every chance to finish while the launch is still
+    // being set up. This alternates them without a sync in between, so the
+    // kernel is reading a buffer whose transfer was issued moments earlier on
+    // another queue. With the barrier missing it reads whatever arrived so far
+    // -- torn, and differently torn each run.
+    for (int round = 1; round <= 8; ++round) {
+        const float fill = static_cast<float>(round);
+        std::fill(pattern.begin(), pattern.end(), fill);
+        device.upload(src, pattern.data(), kBytes);
+        Args round_args;
+        round_args.buffer(src).buffer(dst).uniforms(ScaleUniforms{
+            static_cast<uint32_t>(kWidth), static_cast<uint32_t>(kHeight),
+            static_cast<uint32_t>(kWidth), 3.0f});
+        device.dispatch(scale, Grid{static_cast<uint32_t>(kWidth),
+                                    static_cast<uint32_t>(kHeight), 1},
+                        round_args.data(), round_args.size());
+    }
+    device.sync();
+    device.download(result.data(), dst, kBytes);
+
+    size_t torn = 0;
+    for (size_t i = 0; i < kFloats; ++i) {
+        if (result[i] != 24.0f) {   // the eighth round: 8 * 3
+            ++torn;
+        }
+    }
+    if (torn > 0) {
+        std::fprintf(stderr, "  %zu of %zu values are not from the last upload\n",
+                     torn, kFloats);
+    }
+    check(torn == 0,
+          "a kernel never reads a buffer whose upload is still in flight");
 
     // --- and the pool really pools -----------------------------------------
     const BufferId nativeSrc = device.nativeHandle(src);
