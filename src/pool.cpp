@@ -5,6 +5,7 @@
 #include <bit>
 #include <cassert>
 #include <cstdio>
+#include <thread>
 
 namespace gpe {
 namespace {
@@ -268,6 +269,23 @@ void PooledDevice::sync() {
     // holding every retiring buffer forever.
     completed_.store(submitted_, std::memory_order_release);
     reclaim();
+}
+
+void PooledDevice::waitFor(Submission at) {
+    if (retired(at)) {
+        return;
+    }
+    // Long enough for work that is nearly done to land, short enough not to
+    // burn a core on a backend that will never publish anything.
+    for (int spins = 0; spins < 10000; ++spins) {
+        if (retired(at)) {
+            return;
+        }
+        std::this_thread::yield();
+    }
+    // Nothing arrived. Either the device is genuinely busy or this backend has
+    // no completion handler; both are answered the same way, bluntly.
+    sync();
 }
 
 void PooledDevice::trim() {

@@ -107,6 +107,28 @@ public:
     /// The submission a dispatch queued now would belong to.
     [[nodiscard]] Submission submission() const noexcept { return submitted_; }
 
+    /// Has everything up to `at` finished?
+    ///
+    /// A read of the watermark and nothing else -- no driver call, so it is
+    /// safe to ask inside a frame and cheap enough to ask every frame.
+    [[nodiscard]] bool retired(Submission at) const noexcept {
+        return completed_.load(std::memory_order_acquire) >= at;
+    }
+
+    /// Blocks until `retired(at)`.
+    ///
+    /// This is the stall path: on a pipeline that is keeping up nobody calls
+    /// it, and calling it means a deadline has already been missed.
+    ///
+    /// A limitation worth naming rather than hiding: waiting for one slot needs
+    /// a fence or an event, and the eight-method interface has neither -- it
+    /// has `sync()`, which waits for everything. So this waits on the number a
+    /// backend's completion handler publishes, which costs nothing and is
+    /// exactly per-slot; and if a backend publishes nothing it falls back to
+    /// `sync()` after a bounded spin, which is correct and blunt. A backend
+    /// that wants the sharp version calls notifyCompleted from its handler.
+    void waitFor(Submission at);
+
     /// The native handle behind a pooled one, for a backend that has to reach
     /// the real buffer -- and for the test that checks reuse really is reuse.
     /// `kInvalidBuffer` if the handle is stale.
