@@ -38,6 +38,7 @@
 #include <string_view>
 #include <vector>
 
+#include "completion.h"
 #include "gpe/args.h"
 #include "gpe/device.h"
 #include "gpe_kernels.h"
@@ -45,7 +46,7 @@
 namespace gpe {
 namespace {
 
-class MetalDevice final : public Device {
+class MetalDevice final : public Device, public CompletionReporting {
 public:
     ~MetalDevice() override {
         for (MTL::Buffer* buffer : buffers_) {
@@ -229,15 +230,25 @@ public:
         encoder->dispatchThreads(threads, perGroup);
         encoder->endEncoding();
 
-        // Returns without waiting. `sync` is what waits, and the pool's
-        // watermark is what says which submissions have retired.
+        // Numbered before it is committed, so the handler reports the right
+        // one. Metal runs handlers on its own thread; reportCompleted stores
+        // and returns, which is all a handler is allowed to do.
+        const uint64_t submission = ++submitted_;
+        // The std::function overload, named explicitly: metal-cpp also takes an
+        // Objective-C block and a lambda converts to either.
+        const MTL::HandlerFunction handler = [this, submission](MTL::CommandBuffer*) {
+            reportCompleted(submission);
+        };
+        commands->addCompletedHandler(handler);
+
+        // Returns without waiting. `sync` is what waits, and the counter above
+        // is what says which submissions have retired without waiting at all.
         commands->commit();
-        last_ = commands;
-        last_->retain();
+        commands->retain();
         if (previous_ != nullptr) {
             previous_->release();
         }
-        previous_ = last_;
+        previous_ = commands;
     }
 
     void sync() override {
@@ -272,8 +283,10 @@ private:
 
     MTL::Device*       device_ = nullptr;
     MTL::CommandQueue* queue_ = nullptr;
-    MTL::CommandBuffer* last_ = nullptr;
     MTL::CommandBuffer* previous_ = nullptr;
+    /// This backend's own count, which matches the pool's because both
+    /// increment once per dispatch and nothing else.
+    uint64_t            submitted_ = 0;
 
     std::vector<MTL::Buffer*> buffers_;
     std::vector<Kernel>       kernels_;

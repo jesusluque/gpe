@@ -41,6 +41,7 @@
 #include <string_view>
 #include <vector>
 
+#include "completion.h"
 #include "gpe/device.h"
 
 namespace gpe {
@@ -136,6 +137,10 @@ public:
 
     /// Moves retired buffers from the pending queue to the free lists. Called
     /// on the way into `alloc`; exposed because a test needs to drive it.
+    ///
+    /// Reads the backend's completion counter first, when it has one. That is
+    /// the whole of the handshake: an acquire load on this thread against a
+    /// release store on the driver's.
     void reclaim();
 
 private:
@@ -164,6 +169,10 @@ private:
     std::unique_ptr<Device>     native_;
     size_t                      budget_ = 0;
     std::function<bool(size_t)> onPressure_;
+    /// The native device's completion counter, if it publishes one. Found once
+    /// with a dynamic_cast in the constructor; null for a backend that does
+    /// not, which then falls back to sync().
+    const CompletionReporting*  reporter_ = nullptr;
 
     std::vector<Slot>                  slots_;
     std::vector<std::vector<uint32_t>> freeByBucket_;

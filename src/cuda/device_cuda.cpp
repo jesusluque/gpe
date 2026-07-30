@@ -25,12 +25,14 @@
 // a small ring of staging buffers so that a dispatch never allocates.
 #include <cuda.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "completion.h"
 #include "gpe/args.h"
 #include "gpe/device.h"
 #include "gpe_kernels.h"
@@ -57,7 +59,7 @@ bool ok(CUresult result, const char* what) {
     return false;
 }
 
-class CudaDevice final : public Device {
+class CudaDevice final : public Device, public CompletionReporting {
 public:
     ~CudaDevice() override {
         if (context_ != nullptr) {
@@ -286,6 +288,18 @@ public:
                                 kGroupX, kGroupY, 1, 0, stream_, nullptr,
                                 nullptr),
                  "cuLaunchKernel");
+
+        // And a host function behind it, which the driver runs when the stream
+        // reaches it -- Metal's completion handler, spelled differently.
+        //
+        // `this` is the whole payload. Allocating a {device, submission} pair
+        // per dispatch would be a malloc on the frame path; instead the
+        // callback counts, and because host functions on one stream run in
+        // order the Nth of them is the Nth dispatch. Nothing inside it touches
+        // a CUDA API, which the driver forbids there.
+        ++submitted_;
+        (void)ok(cuLaunchHostFunc(stream_, &CudaDevice::onCompleted, this),
+                 "cuLaunchHostFunc");
     }
 
     void sync() override { (void)ok(cuStreamSynchronize(stream_), "streamSync"); }
@@ -313,6 +327,12 @@ private:
     static constexpr size_t kStagingBytes = 4096;
     static constexpr int    kStagingSlots = 4;
 
+    static void CUDA_CB onCompleted(void* userData) {
+        auto* self = static_cast<CudaDevice*>(userData);
+        self->reportCompleted(
+            self->finished_.fetch_add(1, std::memory_order_relaxed) + 1);
+    }
+
     [[nodiscard]] Allocation* find(BufferId id) {
         if (id == kInvalidBuffer || id > buffers_.size()) {
             return nullptr;
@@ -336,6 +356,10 @@ private:
     CUdeviceptr staging_[kStagingSlots]{};
     void*       pinned_[kStagingSlots]{};
     int         stagingAt_ = 0;
+    /// This backend's own count, matching the pool's because both increment
+    /// once per dispatch and nothing else does.
+    uint64_t              submitted_ = 0;
+    std::atomic<uint64_t> finished_{0};
 
     std::vector<Allocation> buffers_;
     std::vector<Kernel>     kernels_;

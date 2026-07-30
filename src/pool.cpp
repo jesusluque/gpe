@@ -43,6 +43,7 @@ PooledDevice::PooledDevice(std::unique_ptr<Device> native, size_t budgetBytes,
     : native_(std::move(native)),
       budget_(budgetBytes),
       onPressure_(std::move(onPressure)),
+      reporter_(dynamic_cast<const CompletionReporting*>(native_.get())),
       freeByBucket_(kBucketCount) {
     // Slot zero is never handed out, so that a zero BufferId is invalid for the
     // same reason it is in the interface: an uninitialised handle must not
@@ -111,6 +112,9 @@ void PooledDevice::reclaim() {
     // completion handler stores a number; this reads it and does all the work
     // on the render thread, so there is no lock and nothing for a driver
     // callback to contend on.
+    if (reporter_ != nullptr) {
+        notifyCompleted(reporter_->completedSubmissions());
+    }
     const Submission done = completed_.load(std::memory_order_acquire);
     while (!retiring_.empty() && retiring_.front().at <= done) {
         const Retiring entry = retiring_.front();
@@ -303,12 +307,16 @@ void PooledDevice::sync() {
 }
 
 void PooledDevice::waitFor(Submission at) {
+    reclaim();
     if (retired(at)) {
         return;
     }
     // Long enough for work that is nearly done to land, short enough not to
     // burn a core on a backend that will never publish anything.
     for (int spins = 0; spins < 10000; ++spins) {
+        if (reporter_ != nullptr) {
+            notifyCompleted(reporter_->completedSubmissions());
+        }
         if (retired(at)) {
             return;
         }
