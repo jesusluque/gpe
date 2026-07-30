@@ -44,3 +44,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_player.cpp" AND
    NOT GPE_BACKEND STREQUAL "none")
     gpe_test(test_player)
 endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_display.cpp" AND
+   NOT GPE_BACKEND STREQUAL "none")
+    gpe_test(test_display)
+endif()

@@ -18,7 +18,16 @@
 //     uint32 bufferCount
 //     uint32 uniformBytes
 //     BufferId[bufferCount]      in the order the kernel declares them
+//     uint32[bufferCount]        the size of one element of each
 //     unsigned char[uniformBytes]
+//
+// The element sizes are there because Slang's CUDA output describes a buffer as
+// {T* data; size_t count} and the count is in elements, not bytes. The host
+// cannot infer T: a display target is RWStructuredBuffer<uint>, four bytes an
+// element, while a plate is float4 at sixteen. Assuming float4 gives a count
+// four times too small, and Slang's own bound check then silently drops three
+// quarters of every write -- at some sizes, and not at others, which is the
+// worst way for it to be wrong.
 //
 // Each backend reads that and builds whatever its own compiler asked for. The
 // client writes buffers and a plain struct, and nothing it writes knows which
@@ -44,8 +53,9 @@ public:
     /// A buffer the kernel reads or writes, in declaration order. The order is
     /// the contract: kernels declare their buffers in the order the client adds
     /// them here, and nothing checks it because nothing can.
-    Args& buffer(BufferId id) {
+    Args& buffer(BufferId id, uint32_t elementBytes = kBytesPerPixel) {
         buffers_.push_back(id);
+        elements_.push_back(elementBytes);
         return *this;
     }
 
@@ -70,6 +80,7 @@ public:
         append(&count, sizeof(count));
         append(&bytes, sizeof(bytes));
         append(buffers_.data(), buffers_.size() * sizeof(BufferId));
+        append(elements_.data(), elements_.size() * sizeof(uint32_t));
         append(uniforms_.data(), uniforms_.size());
         return blob_;
     }
@@ -81,6 +92,8 @@ public:
 
     struct View {
         const BufferId*      buffers = nullptr;
+        /// Bytes per element of each buffer, parallel to `buffers`.
+        const uint32_t*      elementBytes = nullptr;
         uint32_t             bufferCount = 0;
         const unsigned char* uniforms = nullptr;
         uint32_t             uniformBytes = 0;
@@ -101,15 +114,17 @@ public:
         std::memcpy(&count, bytes, sizeof(count));
         std::memcpy(&uniformBytes, bytes + sizeof(uint32_t), sizeof(uniformBytes));
 
-        const size_t needed = 2 * sizeof(uint32_t) +
-                              size_t{count} * sizeof(BufferId) + uniformBytes;
-        if (needed != size) {
+        const size_t header = 2 * sizeof(uint32_t);
+        const size_t handles = size_t{count} * sizeof(BufferId);
+        const size_t elements = size_t{count} * sizeof(uint32_t);
+        if (header + handles + elements + uniformBytes != size) {
             return view;
         }
-        view.buffers =
-            reinterpret_cast<const BufferId*>(bytes + 2 * sizeof(uint32_t));
+        view.buffers = reinterpret_cast<const BufferId*>(bytes + header);
+        view.elementBytes =
+            reinterpret_cast<const uint32_t*>(bytes + header + handles);
         view.bufferCount = count;
-        view.uniforms = bytes + 2 * sizeof(uint32_t) + count * sizeof(BufferId);
+        view.uniforms = bytes + header + handles + elements;
         view.uniformBytes = uniformBytes;
         view.valid = true;
         return view;
@@ -125,6 +140,7 @@ private:
     }
 
     std::vector<BufferId>              buffers_;
+    std::vector<uint32_t>              elements_;
     std::vector<unsigned char>         uniforms_;
     mutable std::vector<unsigned char> blob_;
 };

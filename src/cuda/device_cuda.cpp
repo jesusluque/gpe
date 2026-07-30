@@ -321,8 +321,16 @@ public:
             const Allocation* a = find(view.buffers[i]);
             SlangBuffer entry{};
             if (a != nullptr) {
+                // Elements, not bytes, and the element size comes from the
+                // caller because the host cannot infer it. Slang bound-checks
+                // against this number: too small and it drops writes without
+                // saying so.
+                const uint32_t stride = view.elementBytes != nullptr &&
+                                                view.elementBytes[i] > 0
+                                            ? view.elementBytes[i]
+                                            : static_cast<uint32_t>(kBytesPerPixel);
                 entry.data = a->ptr;
-                entry.count = a->bytes / kBytesPerPixel;
+                entry.count = a->bytes / stride;
             }
             appendBytes(globals, &entry, sizeof(entry));
         }
