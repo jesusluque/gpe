@@ -35,6 +35,19 @@ public:
     /// slightly smaller picture for a moment.
     [[nodiscard]] bool prepare(int maxWidth, int maxHeight);
 
+    /// The baked display transform: `size`^3 RGBA samples, red fastest,
+    /// covering the linear range [min, max].
+    ///
+    /// Uploaded once, here, rather than per frame -- it changes when the
+    /// display or the view changes, which is when somebody clicks a menu, and
+    /// not sixty times a second. `size` under two removes it and the pass falls
+    /// back to an sRGB encode.
+    ///
+    /// The baking is the host's job, not this class's: OCIO belongs to whoever
+    /// owns the config, and an engine that linked it would be an engine with an
+    /// opinion about colour management.
+    [[nodiscard]] bool setLut(const float* rgba, int size, float min, float max);
+
     /// Transforms, downsamples and packs `source` into the presenter's size,
     /// downloads it, and hands it over.
     ///
@@ -63,6 +76,10 @@ private:
     int                        maxWidth_ = 0;
     int                        maxHeight_ = 0;
     std::vector<unsigned char> host_;
+    BufferId                   lut_ = kInvalidBuffer;
+    int                        lutSize_ = 0;
+    float                      lutMin_ = 0.0f;
+    float                      lutMax_ = 1.0f;
     uint64_t                   presented_ = 0;
     size_t                     lastBytes_ = 0;
 };

@@ -207,6 +207,102 @@ int main() {
         check(blank == 0, "every pixel of a full-size target is written");
     }
 
+    // --- a baked transform replaces the built-in curve ----------------------
+    {
+        // An identity lattice: the pass must hand back exactly what went in,
+        // with no encode at all. If the axis order were wrong this is the test
+        // that would still pass -- so the next one uses a lattice that is
+        // different along each axis, which is the one that catches it.
+        constexpr int kN = 17;
+        std::vector<float> identity(size_t{kN} * kN * kN * 4);
+        for (int b = 0; b < kN; ++b) {
+            for (int g = 0; g < kN; ++g) {
+                for (int r = 0; r < kN; ++r) {
+                    const size_t at =
+                        ((static_cast<size_t>(b) * kN + g) * kN + r) * 4;
+                    identity[at + 0] = static_cast<float>(r) / (kN - 1);
+                    identity[at + 1] = static_cast<float>(g) / (kN - 1);
+                    identity[at + 2] = static_cast<float>(b) / (kN - 1);
+                    identity[at + 3] = 1.0f;
+                }
+            }
+        }
+        check(pass.setLut(identity.data(), kN, 0.0f, 1.0f), "the lattice uploads");
+
+        std::vector<float> plate(size_t{kSrcW} * kSrcH * 4);
+        for (size_t i = 0; i < plate.size(); i += 4) {
+            plate[i + 0] = 0.25f;
+            plate[i + 1] = 0.50f;
+            plate[i + 2] = 0.75f;
+            plate[i + 3] = 1.0f;
+        }
+        device.upload(source, plate.data(), srcBytes);
+
+        Capture capture(kSrcW, kSrcH);
+        pass.present(Image{source, kSrcW, kSrcH, kSrcW}, capture,
+                     DisplayControls{}, 5);
+
+        // Within a code value: the lattice is 17 on a side and these are not
+        // lattice points, so trilinear interpolation is doing real work here.
+        const int r = capture.at(1, 1, 0);
+        const int g = capture.at(1, 1, 1);
+        const int b = capture.at(1, 1, 2);
+        if (std::abs(r - 64) > 1 || std::abs(g - 128) > 1 ||
+            std::abs(b - 191) > 1) {
+            std::fprintf(stderr, "  identity lattice gave %d,%d,%d; wanted about "
+                                 "64,128,191\n", r, g, b);
+        }
+        check(std::abs(r - 64) <= 1 && std::abs(g - 128) <= 1 &&
+                  std::abs(b - 191) <= 1,
+              "an identity lattice passes the linear values straight through");
+    }
+
+    // --- and the axes are not swapped --------------------------------------
+    {
+        // Red, green and blue each mapped to a different function of
+        // themselves, so a lattice indexed in the wrong order comes out
+        // visibly wrong rather than almost right. This is the mistake that
+        // survives an identity test and shows up as a picture with the reds
+        // and blues exchanged.
+        constexpr int kN = 9;
+        std::vector<float> twisted(size_t{kN} * kN * kN * 4);
+        for (int b = 0; b < kN; ++b) {
+            for (int g = 0; g < kN; ++g) {
+                for (int r = 0; r < kN; ++r) {
+                    const size_t at =
+                        ((static_cast<size_t>(b) * kN + g) * kN + r) * 4;
+                    twisted[at + 0] = static_cast<float>(r) / (kN - 1) * 0.25f;
+                    twisted[at + 1] = static_cast<float>(g) / (kN - 1) * 0.50f;
+                    twisted[at + 2] = static_cast<float>(b) / (kN - 1) * 1.00f;
+                    twisted[at + 3] = 1.0f;
+                }
+            }
+        }
+        check(pass.setLut(twisted.data(), kN, 0.0f, 1.0f), "the lattice uploads");
+
+        std::vector<float> plate(size_t{kSrcW} * kSrcH * 4, 1.0f);
+        device.upload(source, plate.data(), srcBytes);
+
+        Capture capture(kSrcW, kSrcH);
+        pass.present(Image{source, kSrcW, kSrcH, kSrcW}, capture,
+                     DisplayControls{}, 6);
+
+        const int r = capture.at(1, 1, 0);
+        const int g = capture.at(1, 1, 1);
+        const int b = capture.at(1, 1, 2);
+        if (std::abs(r - 64) > 1 || std::abs(g - 128) > 1 || b != 255) {
+            std::fprintf(stderr,
+                         "  twisted lattice gave %d,%d,%d; wanted 64,128,255 -- "
+                         "a swap of red and blue would give 255,128,64\n",
+                         r, g, b);
+        }
+        check(std::abs(r - 64) <= 1 && std::abs(g - 128) <= 1 && b == 255,
+              "each axis of the lattice drives its own channel");
+
+        check(pass.setLut(nullptr, 0, 0.0f, 1.0f),
+              "and removing the lattice is not an error");
+    }
+
     device.release(source);
     device.sync();
 

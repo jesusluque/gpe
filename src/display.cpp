@@ -20,8 +20,12 @@ struct DisplayUniforms {
     uint32_t dstStride = 0;
     float    exposure = 0.0f;
     float    gamma = 1.0f;
+    uint32_t lutSize = 0;
+    float    lutMin = 0.0f;
+    float    lutMax = 1.0f;
+    uint32_t pad0 = 0;
 };
-static_assert(sizeof(DisplayUniforms) == 32, "no padding, on any compiler");
+static_assert(sizeof(DisplayUniforms) == 48, "no padding, on any compiler");
 
 }   // namespace
 
@@ -31,6 +35,34 @@ DisplayPass::~DisplayPass() {
             device_->release(target.buffer);
         }
     }
+    if (lut_ != kInvalidBuffer) {
+        device_->release(lut_);
+    }
+}
+
+bool DisplayPass::setLut(const float* rgba, int size, float min, float max) {
+    if (lut_ != kInvalidBuffer) {
+        device_->release(lut_);
+        lut_ = kInvalidBuffer;
+    }
+    lutSize_ = 0;
+    if (rgba == nullptr || size < 2) {
+        // Not an error: it is how a caller says "no transform", and the pass
+        // then encodes sRGB, which is a defensible picture rather than a black
+        // one. The single black sample below still gets bound, because a kernel
+        // with an unbound buffer reads a null pointer.
+        return true;
+    }
+    const size_t samples = static_cast<size_t>(size) * size * size;
+    lut_ = device_->alloc(samples * 4 * sizeof(float));
+    if (lut_ == kInvalidBuffer) {
+        return false;
+    }
+    device_->upload(lut_, rgba, samples * 4 * sizeof(float));
+    lutSize_ = size;
+    lutMin_ = min;
+    lutMax_ = max;
+    return true;
 }
 
 bool DisplayPass::prepare(int maxWidth, int maxHeight) {
@@ -54,6 +86,16 @@ bool DisplayPass::prepare(int maxWidth, int maxHeight) {
         }
     }
     host_.assign(bytes, 0);
+    if (lut_ == kInvalidBuffer) {
+        // One black sample, so the binding is always valid even with no
+        // transform. Sixteen bytes to remove a null dereference from a kernel.
+        lut_ = device_->alloc(4 * sizeof(float));
+        if (lut_ == kInvalidBuffer) {
+            return false;
+        }
+        const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        device_->upload(lut_, black, sizeof(black));
+    }
     maxWidth_ = maxWidth;
     maxHeight_ = maxHeight;
     return true;
@@ -81,11 +123,15 @@ void DisplayPass::present(const Image& source, Presenter& presenter,
 
     Args args;
     // The target is packed RGBA8: one uint per pixel, four bytes an element.
-    args.buffer(source.buf).buffer(target.buffer, 4).uniforms(DisplayUniforms{
-        static_cast<uint32_t>(source.w), static_cast<uint32_t>(source.h),
-        static_cast<uint32_t>(source.stride), static_cast<uint32_t>(width),
-        static_cast<uint32_t>(height), static_cast<uint32_t>(width),
-        controls.exposure, controls.gamma});
+    args.buffer(source.buf)
+        .buffer(target.buffer, 4)
+        .buffer(lut_)
+        .uniforms(DisplayUniforms{
+            static_cast<uint32_t>(source.w), static_cast<uint32_t>(source.h),
+            static_cast<uint32_t>(source.stride), static_cast<uint32_t>(width),
+            static_cast<uint32_t>(height), static_cast<uint32_t>(width),
+            controls.exposure, controls.gamma,
+            static_cast<uint32_t>(lutSize_), lutMin_, lutMax_, 0});
     device_->dispatch(kernel_,
                       Grid{static_cast<uint32_t>(width),
                            static_cast<uint32_t>(height), 1},
