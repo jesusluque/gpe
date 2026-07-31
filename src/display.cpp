@@ -33,8 +33,12 @@ struct DisplayUniforms {
     uint32_t srcBStride = 0;
     float    checkerOriginX = 0.0f;
     float    checkerOriginY = 0.0f;
+    float    viewOriginX = 0.0f;
+    float    viewOriginY = 0.0f;
+    float    viewPerPixelX = 1.0f;
+    float    viewPerPixelY = 1.0f;
 };
-static_assert(sizeof(DisplayUniforms) == 84, "no padding, on any compiler");
+static_assert(sizeof(DisplayUniforms) == 100, "no padding, on any compiler");
 
 }   // namespace
 
@@ -111,13 +115,15 @@ bool DisplayPass::prepare(int maxWidth, int maxHeight) {
 }
 
 void DisplayPass::present(const Image& source, Presenter& presenter,
-                          const DisplayControls& controls, uint64_t frame) {
-    presentWipe(source, Image{}, presenter, controls, frame);
+                          const DisplayControls& controls, uint64_t frame,
+                          const DisplayView& view) {
+    presentWipe(source, Image{}, presenter, controls, frame, view);
 }
 
 void DisplayPass::presentWipe(const Image& source, const Image& right,
                               Presenter& presenter,
-                              const DisplayControls& controls, uint64_t frame) {
+                              const DisplayControls& controls, uint64_t frame,
+                              const DisplayView& view) {
     if (kernel_ == kInvalidKernel || source.buf == kInvalidBuffer) {
         return;
     }
@@ -162,7 +168,16 @@ void DisplayPass::presentWipe(const Image& source, const Image& right,
             // Plus half a pixel, because the caller gives the output's corner
             // and a shader asks about a pixel's centre. Without it the cell
             // edges land a pixel out from the same pattern drawn any other way.
-            controls.checkerOriginX + 0.5f, controls.checkerOriginY + 0.5f});
+            controls.checkerOriginX + 0.5f, controls.checkerOriginY + 0.5f,
+            view.originX, view.originY,
+            // Zero means "fit the source to the target", which is what every
+            // caller wanted before there was a view to give.
+            view.perPixelX > 0.0f ? view.perPixelX
+                                  : static_cast<float>(source.w) /
+                                        static_cast<float>(width),
+            view.perPixelY > 0.0f ? view.perPixelY
+                                  : static_cast<float>(source.h) /
+                                        static_cast<float>(height)});
     device_->dispatch(kernel_,
                       Grid{static_cast<uint32_t>(width),
                            static_cast<uint32_t>(height), 1},

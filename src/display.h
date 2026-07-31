@@ -55,7 +55,8 @@ public:
     /// 8 MB at a 4K widget rather than the 33 MB a full-size readback would be.
     /// The interop version behind the same Presenter removes it entirely.
     void present(const Image& source, Presenter& presenter,
-                 const DisplayControls& controls, uint64_t frame);
+                 const DisplayControls& controls, uint64_t frame,
+                 const DisplayView& view = {});
 
     /// The same, with a second picture on the right of the divider.
     ///
@@ -66,7 +67,7 @@ public:
     /// with a different index.
     void presentWipe(const Image& left, const Image& right,
                      Presenter& presenter, const DisplayControls& controls,
-                     uint64_t frame);
+                     uint64_t frame, const DisplayView& view = {});
 
     /// How many frames have been handed over, and how big the last one was.
     [[nodiscard]] uint64_t presented() const noexcept { return presented_; }

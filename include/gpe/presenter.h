@@ -100,4 +100,26 @@ struct DisplayControls {
     float wipeAt = 0.5f;
 };
 
+/// Which part of the source the target shows, and at what scale.
+///
+/// The default -- and what the pass assumes when it is not given one -- is the
+/// whole source stretched over the whole target. That is right for a viewer
+/// showing a whole shot, and wrong the moment somebody zooms in: the picture
+/// is then prepared at the shot's size times the zoom, of which the window
+/// shows a fraction. A 960x540 plate at 16x is 132 megapixels to fill a
+/// 900x700 window, and it measured at 352 ms a frame against a 40 ms budget.
+/// Frames arrived late and unevenly, which is what "it flickers when you zoom
+/// in" is.
+///
+/// So the caller says what to look at. `originX`/`originY` are the source
+/// coordinate under the target's first pixel, and `perPixel` is how many
+/// source pixels a target pixel spans -- above one the pass averages a box,
+/// below one it interpolates, which is what magnifying should look like.
+struct DisplayView {
+    float originX = 0.0f;
+    float originY = 0.0f;
+    float perPixelX = 0.0f;   ///< Zero means "fit the source to the target".
+    float perPixelY = 0.0f;
+};
+
 }   // namespace gpe

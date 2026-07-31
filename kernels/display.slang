@@ -65,6 +65,14 @@ struct DisplayParams {
     /// picture moves across it.
     float checkerOriginX;
     float checkerOriginY;
+    /// The source coordinate under the target's first pixel, and how many
+    /// source pixels a target pixel spans. Above one this averages a box;
+    /// below one it interpolates, because that is what magnifying a picture
+    /// should look like and what the viewer's own sampler does.
+    float viewOriginX;
+    float viewOriginY;
+    float viewPerPixelX;
+    float viewPerPixelY;
 };
 
 StructuredBuffer<float4>     src;
@@ -159,21 +167,57 @@ void displayMain(uint3 tid: SV_DispatchThreadID) {
     // the shot moves. A box is the cheapest filter that does not do that, and
     // at these ratios it is close enough to a proper one that the difference is
     // not what anybody is judging.
-    const uint x0 = xy.x * sw / params.dstWidth;
-    const uint x1 = max(x0 + 1u, (xy.x + 1u) * sw / params.dstWidth);
-    const uint y0 = xy.y * sh / params.dstHeight;
-    const uint y1 = max(y0 + 1u, (xy.y + 1u) * sh / params.dstHeight);
+    const float leftEdge = params.viewOriginX + float(xy.x) * params.viewPerPixelX;
+    const float lowerEdge = params.viewOriginY + float(xy.y) * params.viewPerPixelY;
+    const float rightEdge = leftEdge + params.viewPerPixelX;
+    const float upperEdge = lowerEdge + params.viewPerPixelY;
 
-    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
-    uint   count = 0;
-    for (uint y = y0; y < y1 && y < sh; ++y) {
-        for (uint x = x0; x < x1 && x < sw; ++x) {
-            const uint at = pixelIndex(uint2(x, y), ss);
-            sum = sum + (useB ? srcB[at] : src[at]);
-            count = count + 1;
+    float4 colour;
+    if (params.viewPerPixelX <= 1.0 && params.viewPerPixelY <= 1.0) {
+        // Magnifying. A box narrower than a pixel is one sample taken at
+        // whatever the truncation lands on, which crawls as soon as anything
+        // moves. Interpolate instead: the same thing the viewer's own sampler
+        // does, so zooming in looks the same whichever path drew it.
+        const float cx = (leftEdge + rightEdge) * 0.5 - 0.5;
+        const float cy = (lowerEdge + upperEdge) * 0.5 - 0.5;
+        const float fx = cx - floor(cx);
+        const float fy = cy - floor(cy);
+        const int   ix = int(floor(cx));
+        const int   iy = int(floor(cy));
+        const int   ix1 = clamp(ix + 1, 0, int(sw) - 1);
+        const int   iy1 = clamp(iy + 1, 0, int(sh) - 1);
+        const int   ix0 = clamp(ix, 0, int(sw) - 1);
+        const int   iy0 = clamp(iy, 0, int(sh) - 1);
+        const float4 s00 = useB ? srcB[pixelIndex(uint2(ix0, iy0), ss)]
+                                : src[pixelIndex(uint2(ix0, iy0), ss)];
+        const float4 s10 = useB ? srcB[pixelIndex(uint2(ix1, iy0), ss)]
+                                : src[pixelIndex(uint2(ix1, iy0), ss)];
+        const float4 s01 = useB ? srcB[pixelIndex(uint2(ix0, iy1), ss)]
+                                : src[pixelIndex(uint2(ix0, iy1), ss)];
+        const float4 s11 = useB ? srcB[pixelIndex(uint2(ix1, iy1), ss)]
+                                : src[pixelIndex(uint2(ix1, iy1), ss)];
+        colour = lerp(lerp(s00, s10, fx), lerp(s01, s11, fx), fy);
+    } else {
+        // Minifying: a box average over the source pixels this output pixel
+        // covers. Not a point sample -- a 4K plate in a 960-pixel widget point
+        // sampled is a viewer full of aliasing, and every fine detail in it,
+        // hair, fabric, noise, turns into something that crawls when the shot
+        // moves.
+        const int x0 = max(int(floor(leftEdge)), 0);
+        const int y0 = max(int(floor(lowerEdge)), 0);
+        const int x1 = min(max(int(ceil(rightEdge)), x0 + 1), int(sw));
+        const int y1 = min(max(int(ceil(upperEdge)), y0 + 1), int(sh));
+        float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+        uint   count = 0;
+        for (int y = y0; y < y1; ++y) {
+            for (int x = x0; x < x1; ++x) {
+                sum = sum + (useB ? srcB[pixelIndex(uint2(x, y), ss)]
+                                  : src[pixelIndex(uint2(x, y), ss)]);
+                count = count + 1;
+            }
         }
+        colour = count > 0 ? sum / float(count) : float4(0.0, 0.0, 0.0, 0.0);
     }
-    float4 colour = count > 0 ? sum / float(count) : float4(0.0, 0.0, 0.0, 0.0);
 
     // Exposure is a linear scale and belongs before the transfer function;
     // gamma is a display-referred tweak and belongs after. Swapping them is
