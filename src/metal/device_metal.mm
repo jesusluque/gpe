@@ -332,6 +332,26 @@ public:
     // memory both sides can reach, which is the same thing this interface is
     // for on CUDA and arrived at from the other direction.
 
+    [[nodiscard]] void* allocShared(size_t bytes, BufferId& out) override {
+        // On Apple silicon a Shared buffer is one allocation the CPU writes and
+        // the GPU reads, with no copy between them and no transfer to schedule.
+        // It goes into the same table as every other buffer, so a dispatch
+        // cannot tell the difference -- which is the point.
+        MTL::Buffer* buffer =
+            device_->newBuffer(bytes, MTL::ResourceStorageModeShared);
+        if (buffer == nullptr) {
+            out = kInvalidBuffer;
+            return nullptr;
+        }
+        // Into `buffers_` only. It is a device buffer that happens to be
+        // host-visible, and its lifetime belongs to the handle -- putting it in
+        // `hostBuffers_` as well gave two owners and two releases, which
+        // arrives as objc_msgSend on freed memory long after the mistake.
+        buffers_.push_back(buffer);
+        out = static_cast<BufferId>(buffers_.size());
+        return buffer->contents();
+    }
+
     [[nodiscard]] void* allocHost(size_t bytes) override {
         MTL::Buffer* buffer =
             device_->newBuffer(bytes, MTL::ResourceStorageModeShared);

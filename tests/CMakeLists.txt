@@ -55,3 +55,10 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_display.cpp" AND
    NOT GPE_BACKEND STREQUAL "none")
     gpe_test(test_display)
 endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench_shared.cpp" AND
+   NOT GPE_BACKEND STREQUAL "none")
+    add_executable(bench_shared bench_shared.cpp)
+    target_link_libraries(bench_shared PRIVATE gpe)
+    target_include_directories(bench_shared PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+endif()

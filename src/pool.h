@@ -107,6 +107,22 @@ public:
 
     // --- everything else ---------------------------------------------------
 
+    /// One allocation the CPU writes and the GPU reads, with no copy between.
+    ///
+    /// Adopted into the pool's table, because a BufferId only means anything
+    /// there -- handing back the backend's own handle is the mistake that cost
+    /// this project a day, and it is the same mistake whichever direction the
+    /// buffer came from.
+    ///
+    /// Null, with `out` invalid, where the machine cannot do it: a discrete
+    /// card across PCIe can map host memory, but a kernel then reads every
+    /// pixel over the bus, and trading a fast DMA for a slow kernel is not an
+    /// optimisation. The caller falls back to alloc + upload, which is what it
+    /// would have done anyway.
+    ///
+    /// Not one of the eight, and not on the frame path: this is prepare-time.
+    [[nodiscard]] void* allocShared(size_t bytes, BufferId& out);
+
     /// Gives every free buffer back to the driver. Never called on the frame
     /// path -- it is the opposite of what the pool is for.
     void trim();
@@ -172,6 +188,8 @@ private:
         size_t   bucketBytes = 0;
         uint32_t generation = 1;   ///< odd while live, even while free
         bool     live = false;
+        /// Host-visible and owned by the caller, so never recycled.
+        bool     shared = false;
     };
 
     struct Retiring {

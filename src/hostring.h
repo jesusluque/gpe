@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "completion.h"
+#include "gpe/types.h"
 
 namespace gpe {
 
@@ -42,6 +43,23 @@ public:
     /// Page-locked host memory, or null.
     [[nodiscard]] virtual void* allocHost(size_t bytes) = 0;
     virtual void freeHost(void* memory) = 0;
+
+    /// One allocation that is both host memory and a device buffer.
+    ///
+    /// The upload that is not there. On a unified-memory machine the CPU and
+    /// the GPU address the same physical pages, so a picture written here is a
+    /// picture the GPU can already read -- there is nothing to copy, and the
+    /// question of what format to copy it in does not arise.
+    ///
+    /// `out` receives a BufferId usable in a dispatch like any other. Returns
+    /// null, and leaves `out` invalid, on a backend or a machine where this
+    /// cannot be done -- a discrete card across PCIe, where the copy is real
+    /// and pretending otherwise would trade a fast transfer for a slow kernel
+    /// reading over the bus a pixel at a time.
+    [[nodiscard]] virtual void* allocShared(size_t bytes, BufferId& out) {
+        out = kInvalidBuffer;
+        return nullptr;
+    }
 };
 
 /// Host buffers between a producer thread and the GPU thread.

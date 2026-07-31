@@ -2,6 +2,7 @@
 #include "pool.h"
 
 #include "gpe/args.h"
+#include "hostring.h"
 
 #include <algorithm>
 #include <bit>
@@ -260,6 +261,17 @@ void PooledDevice::release(BufferId id) {
     //
     // Written here rather than left to cudaMallocAsync so that the rule is the
     // same on both backends and can be tested with neither.
+    if (slot->shared) {
+        // Never recycled: it is the caller's memory, and a free list would hand
+        // the pages they are writing into to somebody else.
+        stats_.bytesHeld -= slot->bucketBytes;
+        native_->release(slot->native);
+        slot->native = kInvalidBuffer;
+        slot->bucketBytes = 0;
+        slot->shared = false;
+        recycledSlots_.push_back(index);
+        return;
+    }
     retiring_.push_back(Retiring{index, submitted_});
     stats_.bytesPending += slot->bucketBytes;
 }
@@ -346,6 +358,45 @@ void PooledDevice::waitFor(Submission at) {
     // Nothing arrived. Either the device is genuinely busy or this backend has
     // no completion handler; both are answered the same way, bluntly.
     sync();
+}
+
+void* PooledDevice::allocShared(size_t bytes, BufferId& out) {
+    checkThread("allocShared");
+    out = kInvalidBuffer;
+    auto* staging = dynamic_cast<HostStaging*>(native_.get());
+    if (staging == nullptr || bytes == 0) {
+        return nullptr;
+    }
+    BufferId nativeId = kInvalidBuffer;
+    void*    memory = staging->allocShared(bytes, nativeId);
+    if (memory == nullptr || nativeId == kInvalidBuffer) {
+        return nullptr;
+    }
+
+    // Adopted, not pooled. It never goes on a free list and is never handed to
+    // anybody else: the caller owns this memory for as long as it holds the
+    // pointer, and recycling it under them would be recycling the buffer they
+    // are still writing their next frame into.
+    uint32_t index = 0;
+    if (!recycledSlots_.empty()) {
+        index = recycledSlots_.back();
+        recycledSlots_.pop_back();
+    } else {
+        index = static_cast<uint32_t>(slots_.size());
+        slots_.emplace_back();
+    }
+    Slot& slot = slots_[index];
+    slot.native = nativeId;
+    slot.bucketBytes = bytes;
+    slot.shared = true;
+    ++slot.generation;
+    slot.live = true;
+    stats_.bytesHeld += bytes;
+    stats_.bytesInUse += bytes;
+    ++stats_.liveBuffers;
+
+    out = (static_cast<BufferId>(slot.generation) << kBufferSlotBits) | index;
+    return memory;
 }
 
 void PooledDevice::trim() {
