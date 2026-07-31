@@ -40,6 +40,7 @@
 
 #include "completion.h"
 #include "hostring.h"
+#include "gpe/adopt.h"
 #include "gpe/args.h"
 #include "gpe/device.h"
 #include "gpe_kernels.h"
@@ -80,6 +81,21 @@ public:
         if (device_ != nullptr) {
             device_->release();
         }
+    }
+
+    /// Takes a device somebody else made, retaining it for as long as this
+    /// object lives. The caller keeps its own reference: it is still drawing
+    /// with it.
+    [[nodiscard]] bool adopt(MTL::Device* device) {
+        if (device == nullptr) {
+            return false;
+        }
+        device_ = device->retain();
+        queue_ = device_->newCommandQueue();
+        blitQueue_ = device_->newCommandQueue();
+        uploadEvent_ = device_->newEvent();
+        return queue_ != nullptr && blitQueue_ != nullptr &&
+               uploadEvent_ != nullptr;
     }
 
     [[nodiscard]] bool open() {
@@ -474,6 +490,14 @@ private:
 };
 
 }   // namespace
+
+std::unique_ptr<Device> adoptMetalDevice(void* mtlDevice) {
+    auto device = std::make_unique<MetalDevice>();
+    if (!device->adopt(static_cast<MTL::Device*>(mtlDevice))) {
+        return nullptr;
+    }
+    return device;
+}
 
 std::unique_ptr<Device> Device::create() {
     auto device = std::make_unique<MetalDevice>();

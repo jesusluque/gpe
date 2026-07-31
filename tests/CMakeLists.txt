@@ -14,7 +14,7 @@ gpe_test(test_types)
 # The viewer test needs Qt, so it exists only where the viewer does.
 if(TARGET gpe_viewer AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_viewer.cpp")
     add_executable(test_viewer test_viewer.cpp)
-    target_link_libraries(test_viewer PRIVATE gpe_viewer)
+    target_link_libraries(test_viewer PRIVATE gpe_viewer gpe)
     add_test(NAME test_viewer COMMAND test_viewer)
 endif()
 

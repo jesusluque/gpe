@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "gpe/adopt.h"
+#include "gpe/device.h"
 #include "rhi_presenter.h"
 
 namespace {
@@ -142,6 +144,43 @@ int main(int argc, char** argv) {
         check(presenter.uploads() == before,
               "a present with no frame open is refused, not swallowed");
     }
+
+#if defined(Q_OS_MACOS)
+    // --- one device for compute and for drawing -----------------------------
+    {
+        // The whole reason adoption exists. QRhi made a device to draw with;
+        // gpe takes that one rather than finding its own. Two devices on one
+        // GPU would mean every buffer crossing between them is an interop
+        // problem -- a shared handle and a fence neither side can express in
+        // the other's vocabulary. One device has no across to cross.
+        const QRhiNativeHandles* handles = rhi->nativeHandles();
+        const auto* metal = static_cast<const QRhiMetalNativeHandles*>(handles);
+        check(metal != nullptr && metal->dev != nullptr,
+              "QRhi hands over the device it is drawing with");
+
+        if (metal != nullptr && metal->dev != nullptr) {
+            std::unique_ptr<gpe::Device> shared =
+                gpe::adoptMetalDevice(metal->dev);
+            check(shared != nullptr, "and gpe drives that one instead of its own");
+
+            if (shared != nullptr) {
+                check(shared->backend() == gpe::Device::Backend::Metal,
+                      "as a Metal backend like any other");
+                // And it really works: a kernel loads and a buffer allocates on
+                // a device this object did not create.
+                const gpe::KernelId scale = shared->load("scale");
+                check(scale != gpe::kInvalidKernel,
+                      "kernels load on the adopted device");
+                const gpe::BufferId buffer = shared->alloc(1024);
+                check(buffer != gpe::kInvalidBuffer,
+                      "and memory allocates on it");
+                shared->release(buffer);
+                shared->sync();
+                std::puts("  adopted the renderer's device: kernels load and memory allocates on it");
+            }
+        }
+    }
+#endif
 
     if (failures == 0) {
         std::puts("test_viewer: ok");
