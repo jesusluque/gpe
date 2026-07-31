@@ -283,12 +283,15 @@ void PooledDevice::release(BufferId id) {
 }
 
 void PooledDevice::upload(BufferId id, const void* src, size_t bytes) {
+    // `resolve` reads the slot table, which another thread may be growing.
+    const std::lock_guard<std::recursive_mutex> held(guard_);
     if (const Slot* slot = resolve(id); slot != nullptr) {
         native_->upload(slot->native, src, bytes);
     }
 }
 
 void PooledDevice::download(void* dst, BufferId id, size_t bytes) {
+    const std::lock_guard<std::recursive_mutex> held(guard_);
     if (const Slot* slot = resolve(id); slot != nullptr) {
         native_->download(dst, slot->native, bytes);
     }
@@ -298,6 +301,20 @@ KernelId PooledDevice::load(std::string_view name) { return native_->load(name);
 
 void PooledDevice::dispatch(KernelId kernel, Grid grid, const void* args,
                             size_t bytes) {
+    // Locked, like everything else that touches the slot table.
+    //
+    // This used to be the one call that did not, on the grounds that dispatch
+    // belongs to a single thread. That was true of dispatching and never true
+    // of allocating: images are made on render threads, by design, and
+    // `allocShared` grows `slots_` under the lock while this read it without
+    // one. When the vector reallocated mid-read, `nativeHandle` returned
+    // rubbish, the backend dispatched over a wild buffer, and the frame came
+    // back exactly as it went in -- cleared. Intermittently, in proportion to
+    // how much was being allocated, which is to say during playback.
+    //
+    // The cost is one uncontended lock per dispatch. What it buys is a picture.
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+
     // The handles in the blob are ours, and the backend has never heard of
     // them.
     //
