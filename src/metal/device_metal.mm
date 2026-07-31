@@ -144,7 +144,15 @@ public:
 
     void upload(BufferId id, const void* src, size_t bytes) override {
         MTL::Buffer** slot = find(id);
-        if (slot == nullptr || src == nullptr || bytes == 0) {
+        // `*slot` as well as `slot`, which release and download both check and
+        // this did not. A released buffer leaves a live slot holding null, and
+        // handing null to the blit encoder as a destination is a segmentation
+        // fault inside the driver -- a long way from whoever kept the handle
+        // too long, and with nothing on the stack to say so.
+        if (slot == nullptr || *slot == nullptr || src == nullptr || bytes == 0) {
+            std::fprintf(stderr,
+                         "gpe/metal: upload to buffer %llu, which is not live\n",
+                         static_cast<unsigned long long>(id));
             return;
         }
         // Already one of ours? Then blit straight from it.

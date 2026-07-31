@@ -174,29 +174,20 @@ void displayMain(uint3 tid: SV_DispatchThreadID) {
 
     float4 colour;
     if (params.viewPerPixelX <= 1.0 && params.viewPerPixelY <= 1.0) {
-        // Magnifying. A box narrower than a pixel is one sample taken at
-        // whatever the truncation lands on, which crawls as soon as anything
-        // moves. Interpolate instead: the same thing the viewer's own sampler
-        // does, so zooming in looks the same whichever path drew it.
-        const float cx = (leftEdge + rightEdge) * 0.5 - 0.5;
-        const float cy = (lowerEdge + upperEdge) * 0.5 - 0.5;
-        const float fx = cx - floor(cx);
-        const float fy = cy - floor(cy);
-        const int   ix = int(floor(cx));
-        const int   iy = int(floor(cy));
-        const int   ix1 = clamp(ix + 1, 0, int(sw) - 1);
-        const int   iy1 = clamp(iy + 1, 0, int(sh) - 1);
-        const int   ix0 = clamp(ix, 0, int(sw) - 1);
-        const int   iy0 = clamp(iy, 0, int(sh) - 1);
-        const float4 s00 = useB ? srcB[pixelIndex(uint2(ix0, iy0), ss)]
-                                : src[pixelIndex(uint2(ix0, iy0), ss)];
-        const float4 s10 = useB ? srcB[pixelIndex(uint2(ix1, iy0), ss)]
-                                : src[pixelIndex(uint2(ix1, iy0), ss)];
-        const float4 s01 = useB ? srcB[pixelIndex(uint2(ix0, iy1), ss)]
-                                : src[pixelIndex(uint2(ix0, iy1), ss)];
-        const float4 s11 = useB ? srcB[pixelIndex(uint2(ix1, iy1), ss)]
-                                : src[pixelIndex(uint2(ix1, iy1), ss)];
-        colour = lerp(lerp(s00, s10, fx), lerp(s01, s11, fx), fy);
+        // Magnifying: the nearest source pixel, not a blend of its neighbours.
+        //
+        // Above 1:1 a compositor's viewer shows the pixels. That is what people
+        // zoom in to look at, and it is what this host's own sampler does --
+        // GL_NEAREST on both its textures. Interpolating here instead made
+        // every frame the GPU path drew visibly softer than the occasional one
+        // handed back to the ordinary path, so a playback alternated between
+        // blurred letters and clean ones.
+        const int ix = clamp(int(floor(leftEdge + params.viewPerPixelX * 0.5)),
+                             0, int(sw) - 1);
+        const int iy = clamp(int(floor(lowerEdge + params.viewPerPixelY * 0.5)),
+                             0, int(sh) - 1);
+        colour = useB ? srcB[pixelIndex(uint2(ix, iy), ss)]
+                      : src[pixelIndex(uint2(ix, iy), ss)];
     } else {
         // Minifying: a box average over the source pixels this output pixel
         // covers. Not a point sample -- a 4K plate in a 960-pixel widget point
