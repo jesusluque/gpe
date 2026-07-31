@@ -31,19 +31,26 @@
 //
 // `sync()` is likewise a prepare-time call. Inside a frame it is forbidden.
 //
-// ONE THREAD
+// THREADS
 //
 // A BufferId is a slot and a generation in *this* pool's table and means
-// nothing anywhere else, so it must never cross a thread boundary. The pool is
-// used from the thread that owns it and no other; where work has to be handed
-// between threads, what crosses is an index into a ring both sides pre-reserved
-// -- host memory on the decode side, arena slots on the device side -- and
-// never a handle.
+// nothing anywhere else, so it must never cross a thread boundary: where work
+// is handed between threads, what crosses is an index into a ring both sides
+// pre-reserved -- host memory on the decode side, arena slots on the device
+// side -- and never a handle. That much is unchanged.
 //
-// This is an invariant, not a preference, so it is checked: every entry point
-// records the thread that first used the pool and complains once if another
-// one appears. Cheap enough to leave in, because the alternative is a data race
-// that shows up as a wrong picture under load and nowhere else.
+// The pool itself is locked. It was single-threaded by contract, and the first
+// real application broke the contract immediately and correctly: a compositor
+// allocates its images on render threads, and an image is where the pool's
+// memory goes. The check that caught it is still here and still fires, because
+// a handle crossing threads is a different mistake from two threads allocating.
+//
+// The lock is affordable precisely because of the split this file already
+// makes. `alloc` is prepare-time and off the frame path; what the frame path
+// touches is the arenas, which hold buffers already taken and never call in
+// here. A mutex on a call that happens when a chain is built costs nothing a
+// frame can feel, and buys the correctness that the contract was only asking
+// for politely.
 #pragma once
 
 #include <atomic>
@@ -53,6 +60,7 @@
 #include <functional>
 #include <memory>
 #include <string_view>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -183,6 +191,10 @@ public:
     void reclaim();
 
 private:
+    /// The bodies, with `guard_` already held.
+    void reclaimLocked();
+    void trimLocked();
+
     struct Slot {
         BufferId native = kInvalidBuffer;
         size_t   bucketBytes = 0;
@@ -207,7 +219,10 @@ private:
     /// Everything short of failing, in order, until `bytes` will fit.
     [[nodiscard]] bool makeRoom(size_t bytes);
 
-    /// Complains once if the pool is touched from a second thread.
+    /// Complains once if a *handle* is used from a thread other than the one
+    /// that first used the pool. Not a lock: the lock below makes the tables
+    /// safe, and this says the thing the lock cannot -- that a BufferId is
+    /// travelling somewhere it does not mean anything.
     void checkThread(const char* where) const;
 
     std::unique_ptr<Device>     native_;
@@ -232,6 +247,15 @@ private:
     std::atomic<Submission> completed_{0};
 
     Stats stats_{};
+
+    /// Guards every table in this object. See the note on threads above for
+    /// why a lock here is affordable and a lock in the arenas would not be.
+    ///
+    /// Recursive because the memory-pressure callback is *expected* to come
+    /// back in: the pool asks its owner to give something up, and the way an
+    /// owner gives a buffer up is to release it. A plain mutex deadlocks there,
+    /// which is exactly what it did.
+    mutable std::recursive_mutex guard_;
 
     /// The thread that first used this pool, and whether it has been told about
     /// a second one. Mutable because the check belongs in const methods too.

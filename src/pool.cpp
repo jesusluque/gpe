@@ -90,9 +90,10 @@ void PooledDevice::checkThread(const char* where) const {
     }
     complainedAboutThread_ = true;
     std::fprintf(stderr,
-                 "gpe: the pool was used from a second thread (%s). A BufferId "
-                 "means nothing outside the pool that issued it; hand work "
-                 "between threads as an index into a pre-reserved ring.\n",
+                 "gpe: %s came from a second thread. The tables are locked, so "
+                 "this is safe -- but submissions are ordered, and a dispatch "
+                 "issued from elsewhere lands in a sequence the arenas are "
+                 "counting on.\n",
                  where);
 }
 
@@ -126,6 +127,11 @@ BufferId PooledDevice::nativeHandle(BufferId id) const noexcept {
 }
 
 void PooledDevice::reclaim() {
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    reclaimLocked();
+}
+
+void PooledDevice::reclaimLocked() {
     // The one place the two threads meet, and it is a single acquire load. The
     // completion handler stores a number; this reads it and does all the work
     // on the render thread, so there is no lock and nothing for a driver
@@ -153,7 +159,7 @@ bool PooledDevice::makeRoom(size_t bytes) {
 
     // 1. Buffers whose submission has already retired but that nobody has
     //    drained yet. Free, in both senses.
-    reclaim();
+    reclaimLocked();
     if (stats_.bytesHeld + bytes <= budget_) {
         return true;
     }
@@ -162,7 +168,7 @@ bool PooledDevice::makeRoom(size_t bytes) {
     //    costs real time, which is exactly why `alloc` is a prepare-time call.
     native_->sync();
     completed_.store(submitted_, std::memory_order_release);
-    reclaim();
+    reclaimLocked();
     if (stats_.bytesHeld + bytes <= budget_) {
         return true;
     }
@@ -170,7 +176,7 @@ bool PooledDevice::makeRoom(size_t bytes) {
     // 3. Give the driver back everything the pool is holding for reuse. The
     //    pool exists to avoid this; being out of memory is when it stops being
     //    the right trade.
-    trim();
+    trimLocked();
     if (stats_.bytesHeld + bytes <= budget_) {
         return true;
     }
@@ -179,8 +185,8 @@ bool PooledDevice::makeRoom(size_t bytes) {
     //    must not; it says how much it needs and is told whether anything was
     //    given up. Once -- a loop here is a stall of unbounded length.
     if (onPressure_ && onPressure_(bytes)) {
-        reclaim();
-        trim();
+        reclaimLocked();
+        trimLocked();
         if (stats_.bytesHeld + bytes <= budget_) {
             return true;
         }
@@ -189,7 +195,7 @@ bool PooledDevice::makeRoom(size_t bytes) {
 }
 
 BufferId PooledDevice::alloc(size_t bytes) {
-    checkThread("alloc");
+    const std::lock_guard<std::recursive_mutex> held(guard_);
     if (bytes == 0) {
         return kInvalidBuffer;
     }
@@ -199,7 +205,7 @@ BufferId PooledDevice::alloc(size_t bytes) {
         return kInvalidBuffer;   // past the biggest bucket; nothing to serve it
     }
 
-    reclaim();
+    reclaimLocked();
 
     uint32_t index = 0;
     if (!freeByBucket_[bucket].empty()) {
@@ -241,7 +247,7 @@ BufferId PooledDevice::alloc(size_t bytes) {
 }
 
 void PooledDevice::release(BufferId id) {
-    checkThread("release");
+    const std::lock_guard<std::recursive_mutex> held(guard_);
     Slot* slot = resolve(id);
     if (slot == nullptr) {
         return;   // stale or never ours; releasing twice is not a crash
@@ -330,13 +336,13 @@ void PooledDevice::dispatch(KernelId kernel, Grid grid, const void* args,
 }
 
 void PooledDevice::sync() {
-    checkThread("sync");
+    const std::lock_guard<std::recursive_mutex> held(guard_);
     native_->sync();
     // A backend with completion handlers publishes this itself; doing it here
     // too costs nothing and keeps a backend that has none -- or a test -- from
     // holding every retiring buffer forever.
     completed_.store(submitted_, std::memory_order_release);
-    reclaim();
+    reclaimLocked();
 }
 
 void PooledDevice::waitFor(Submission at) {
@@ -361,7 +367,7 @@ void PooledDevice::waitFor(Submission at) {
 }
 
 void* PooledDevice::allocShared(size_t bytes, BufferId& out) {
-    checkThread("allocShared");
+    const std::lock_guard<std::recursive_mutex> held(guard_);
     out = kInvalidBuffer;
     auto* staging = dynamic_cast<HostStaging*>(native_.get());
     if (staging == nullptr || bytes == 0) {
@@ -400,7 +406,12 @@ void* PooledDevice::allocShared(size_t bytes, BufferId& out) {
 }
 
 void PooledDevice::trim() {
-    reclaim();
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    trimLocked();
+}
+
+void PooledDevice::trimLocked() {
+    reclaimLocked();
     for (std::vector<uint32_t>& bucket : freeByBucket_) {
         for (const uint32_t index : bucket) {
             Slot& slot = slots_[index];
