@@ -52,11 +52,22 @@ struct DisplayParams {
     /// that is missing look identical.
     uint  checkerboard;
     float checkerSize;
+    /// The other side of a wipe. Zero for none.
+    uint  wipeEnabled;
+    /// Where the divider is, 0..1 across the output.
+    float wipeAt;
+    /// The second source, which need not be the same size as the first.
+    uint  srcBWidth;
+    uint  srcBHeight;
+    uint  srcBStride;
     uint  pad0;
-    uint  pad1;
 };
 
 StructuredBuffer<float4>     src;
+/// The other side of a wipe. Always bound -- a kernel with an unbound buffer
+/// reads a null pointer -- and ignored when `wipeEnabled` is zero, in which
+/// case the host binds a single sample rather than a picture.
+StructuredBuffer<float4>     srcB;
 RWStructuredBuffer<uint>     dst;   // packed RGBA8, one uint per pixel
 /// The baked transform, `lutSize`^3 entries, red fastest. Always bound: a
 /// kernel with an unbound buffer is a kernel that reads a null pointer, so the
@@ -122,6 +133,20 @@ void displayMain(uint3 tid: SV_DispatchThreadID) {
         return;
     }
 
+    // Which side of the divider this pixel is on.
+    //
+    // One dispatch that chooses per pixel, where the viewer's own path is two
+    // draws with a scissor. That was not a preference there: the display
+    // transform is OCIO's shader and not ours to add a uniform to, so the only
+    // way to show two pictures through it was to run it twice. A kernel we own
+    // has no such constraint, and one dispatch also means the two sides cannot
+    // disagree about anything -- they are the same code with a different index.
+    const bool useB = params.wipeEnabled != 0u &&
+                      float(xy.x) >= params.wipeAt * float(params.dstWidth);
+    const uint sw = useB ? params.srcBWidth : params.srcWidth;
+    const uint sh = useB ? params.srcBHeight : params.srcHeight;
+    const uint ss = useB ? params.srcBStride : params.srcStride;
+
     // A box average over the source pixels this output pixel covers.
     //
     // Not a point sample: a viewer showing a 4K plate in a 960-pixel widget
@@ -130,16 +155,17 @@ void displayMain(uint3 tid: SV_DispatchThreadID) {
     // the shot moves. A box is the cheapest filter that does not do that, and
     // at these ratios it is close enough to a proper one that the difference is
     // not what anybody is judging.
-    const uint x0 = xy.x * params.srcWidth / params.dstWidth;
-    const uint x1 = max(x0 + 1u, (xy.x + 1u) * params.srcWidth / params.dstWidth);
-    const uint y0 = xy.y * params.srcHeight / params.dstHeight;
-    const uint y1 = max(y0 + 1u, (xy.y + 1u) * params.srcHeight / params.dstHeight);
+    const uint x0 = xy.x * sw / params.dstWidth;
+    const uint x1 = max(x0 + 1u, (xy.x + 1u) * sw / params.dstWidth);
+    const uint y0 = xy.y * sh / params.dstHeight;
+    const uint y1 = max(y0 + 1u, (xy.y + 1u) * sh / params.dstHeight);
 
     float4 sum = float4(0.0, 0.0, 0.0, 0.0);
     uint   count = 0;
-    for (uint y = y0; y < y1 && y < params.srcHeight; ++y) {
-        for (uint x = x0; x < x1 && x < params.srcWidth; ++x) {
-            sum = sum + src[pixelIndex(uint2(x, y), params.srcStride)];
+    for (uint y = y0; y < y1 && y < sh; ++y) {
+        for (uint x = x0; x < x1 && x < sw; ++x) {
+            const uint at = pixelIndex(uint2(x, y), ss);
+            sum = sum + (useB ? srcB[at] : src[at]);
             count = count + 1;
         }
     }

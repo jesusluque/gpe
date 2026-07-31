@@ -57,6 +57,17 @@ public:
     void present(const Image& source, Presenter& presenter,
                  const DisplayControls& controls, uint64_t frame);
 
+    /// The same, with a second picture on the right of the divider.
+    ///
+    /// One dispatch rather than two: the viewer's own path draws twice with a
+    /// scissor because the display transform is OCIO's shader and not its to
+    /// add a uniform to, and a kernel we own has no such constraint. It also
+    /// means the two sides cannot disagree about anything, being the same code
+    /// with a different index.
+    void presentWipe(const Image& left, const Image& right,
+                     Presenter& presenter, const DisplayControls& controls,
+                     uint64_t frame);
+
     /// How many frames have been handed over, and how big the last one was.
     [[nodiscard]] uint64_t presented() const noexcept { return presented_; }
     [[nodiscard]] size_t lastBytes() const noexcept { return lastBytes_; }

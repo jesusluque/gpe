@@ -83,6 +83,10 @@ struct DisplayControls {
     /// look the same.
     bool  checkerboard = true;
     float checkerSize = 16.0f;
+
+    /// The divider of an A/B wipe, 0..1 across the output. Only read when the
+    /// pass is given a second image.
+    float wipeAt = 0.5f;
 };
 
 }   // namespace gpe

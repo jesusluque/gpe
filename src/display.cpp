@@ -26,10 +26,14 @@ struct DisplayUniforms {
     uint32_t channels = 0;
     uint32_t checkerboard = 0;
     float    checkerSize = 16.0f;
+    uint32_t wipeEnabled = 0;
+    float    wipeAt = 0.5f;
+    uint32_t srcBWidth = 0;
+    uint32_t srcBHeight = 0;
+    uint32_t srcBStride = 0;
     uint32_t pad0 = 0;
-    uint32_t pad1 = 0;
 };
-static_assert(sizeof(DisplayUniforms) == 64, "no padding, on any compiler");
+static_assert(sizeof(DisplayUniforms) == 80, "no padding, on any compiler");
 
 }   // namespace
 
@@ -107,6 +111,12 @@ bool DisplayPass::prepare(int maxWidth, int maxHeight) {
 
 void DisplayPass::present(const Image& source, Presenter& presenter,
                           const DisplayControls& controls, uint64_t frame) {
+    presentWipe(source, Image{}, presenter, controls, frame);
+}
+
+void DisplayPass::presentWipe(const Image& source, const Image& right,
+                              Presenter& presenter,
+                              const DisplayControls& controls, uint64_t frame) {
     if (kernel_ == kInvalidKernel || source.buf == kInvalidBuffer) {
         return;
     }
@@ -127,7 +137,14 @@ void DisplayPass::present(const Image& source, Presenter& presenter,
 
     Args args;
     // The target is packed RGBA8: one uint per pixel, four bytes an element.
+    // The second side is always bound, because a kernel with an unbound buffer
+    // reads a null pointer; with no wipe it is the first image again, which
+    // costs nothing and is never read.
+    const bool  wiping = right.buf != kInvalidBuffer;
+    const Image other = wiping ? right : source;
+
     args.buffer(source.buf)
+        .buffer(other.buf)
         .buffer(target.buffer, 4)
         .buffer(lut_)
         .uniforms(DisplayUniforms{
@@ -137,7 +154,10 @@ void DisplayPass::present(const Image& source, Presenter& presenter,
             controls.exposure, controls.gamma,
             static_cast<uint32_t>(lutSize_), lutMin_, lutMax_,
             static_cast<uint32_t>(controls.channels),
-            controls.checkerboard ? 1u : 0u, controls.checkerSize, 0, 0});
+            controls.checkerboard ? 1u : 0u, controls.checkerSize,
+            wiping ? 1u : 0u, controls.wipeAt,
+            static_cast<uint32_t>(other.w), static_cast<uint32_t>(other.h),
+            static_cast<uint32_t>(other.stride), 0});
     device_->dispatch(kernel_,
                       Grid{static_cast<uint32_t>(width),
                            static_cast<uint32_t>(height), 1},

@@ -384,6 +384,66 @@ int main() {
         check(plain.at(4, 4, 0) == 0, "and turning it off leaves black");
     }
 
+    // --- the wipe: two pictures, one dispatch, one transform ----------------
+    {
+        // Both sides must go through the same transform, because the whole
+        // point of a wipe is that the difference you see is the difference
+        // between the pictures. Two sides encoded differently would make every
+        // comparison a lie, and it is the kind of lie that looks like a grade.
+        const BufferId other = device.alloc(srcBytes);
+        check(other != kInvalidBuffer, "the second side allocates");
+
+        std::vector<float> left(size_t{kSrcW} * kSrcH * 4, 0.0f);
+        std::vector<float> right(size_t{kSrcW} * kSrcH * 4, 0.0f);
+        for (size_t i = 0; i < left.size(); i += 4) {
+            left[i + 0] = 0.25f;   // a value either side of the divider that
+            left[i + 3] = 1.0f;    // encodes to something distinguishable
+            right[i + 1] = 0.75f;
+            right[i + 3] = 1.0f;
+        }
+        device.upload(source, left.data(), srcBytes);
+        device.upload(other, right.data(), srcBytes);
+
+        Capture capture(kSrcW, kSrcH);
+        DisplayControls controls;
+        controls.wipeAt = 0.5f;
+        pass.presentWipe(Image{source, kSrcW, kSrcH, kSrcW},
+                         Image{other, kSrcW, kSrcH, kSrcW}, capture, controls,
+                         11);
+
+        const auto expectLeft = static_cast<int>(srgb(0.25) * 255.0 + 0.5);
+        const auto expectRight = static_cast<int>(srgb(0.75) * 255.0 + 0.5);
+
+        // Left of the divider: the first picture, red only.
+        check(capture.at(kSrcW / 4, kSrcH / 2, 0) == expectLeft,
+              "left of the divider is the first picture");
+        check(capture.at(kSrcW / 4, kSrcH / 2, 1) == 0,
+              "and only the first picture");
+        // Right: the second, green only.
+        check(capture.at(3 * kSrcW / 4, kSrcH / 2, 1) == expectRight,
+              "right of the divider is the second picture");
+        check(capture.at(3 * kSrcW / 4, kSrcH / 2, 0) == 0,
+              "and only the second picture");
+
+        // The divider moves.
+        controls.wipeAt = 0.9f;
+        Capture moved(kSrcW, kSrcH);
+        pass.presentWipe(Image{source, kSrcW, kSrcH, kSrcW},
+                         Image{other, kSrcW, kSrcH, kSrcW}, moved, controls, 12);
+        check(moved.at(3 * kSrcW / 4, kSrcH / 2, 0) == expectLeft,
+              "a divider at 0.9 leaves three quarters showing the first");
+
+        // And with no second image the pass is unchanged: a wipe of one
+        // picture is not a wipe, and must not cost a branch's worth of
+        // different answer.
+        Capture plain(kSrcW, kSrcH);
+        pass.present(Image{source, kSrcW, kSrcH, kSrcW}, plain, controls, 13);
+        check(plain.at(3 * kSrcW / 4, kSrcH / 2, 0) == expectLeft,
+              "and without a second image nothing wipes");
+
+        device.release(other);
+    }
+
     device.release(source);
     device.sync();
 
