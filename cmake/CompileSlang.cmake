@@ -55,6 +55,21 @@ endif()
 set(GPE_KERNEL_DIR "${GPE_BUILD}/kernels")
 file(MAKE_DIRECTORY "${GPE_KERNEL_DIR}")
 
+# Visible to whoever added this project, so a plugin built alongside it can
+# compile its own kernels with the same toolchain rather than searching for one
+# again -- and, more to the point, so it cannot end up with a different one.
+#
+# A no-op when gpe is the top-level project, which is why it is guarded: there
+# is no parent to tell.
+if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(GPE_BACKEND   "${GPE_BACKEND}"   PARENT_SCOPE)
+    set(GPE_SLANGC    "${GPE_SLANGC}"    PARENT_SCOPE)
+    set(GPE_METAL     "${GPE_METAL}"     PARENT_SCOPE)
+    set(GPE_METALLIB  "${GPE_METALLIB}"  PARENT_SCOPE)
+    set(GPE_NVCC      "${GPE_NVCC}"      PARENT_SCOPE)
+    set(GPE_CUDA_ARCH "${GPE_CUDA_ARCH}" PARENT_SCOPE)
+endif()
+
 # gpe_compile_slang(<name> ENTRY <entry>)
 #
 # Compiles kernels/<name>.slang for this backend and leaves the blob at

@@ -72,6 +72,20 @@ public:
         return *this;
     }
 
+    /// The same, when the caller has bytes rather than a type.
+    ///
+    /// For a host relaying a uniform block from somewhere it cannot see the
+    /// declaration -- a plugin, across a boundary. It is exactly as unchecked
+    /// as the templated form, which is to say entirely: the bytes must match
+    /// the kernel's struct and nothing here can know whether they do.
+    Args& uniformBytes(const void* data, size_t bytes) {
+        uniforms_.resize(bytes);
+        if (data != nullptr && bytes > 0) {
+            std::memcpy(uniforms_.data(), data, bytes);
+        }
+        return *this;
+    }
+
     /// Serialises. The result stays alive as long as this object.
     [[nodiscard]] const std::vector<unsigned char>& blob() const {
         blob_.clear();
