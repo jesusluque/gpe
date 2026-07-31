@@ -60,7 +60,11 @@ struct DisplayParams {
     uint  srcBWidth;
     uint  srcBHeight;
     uint  srcBStride;
-    uint  pad0;
+    /// Where the output sits in what the checkerboard is anchored to. Added
+    /// before the cell is worked out, so the pattern stays put while the
+    /// picture moves across it.
+    float checkerOriginX;
+    float checkerOriginY;
 };
 
 StructuredBuffer<float4>     src;
@@ -210,7 +214,8 @@ void displayMain(uint3 tid: SV_DispatchThreadID) {
     // change shade with the view, and it is chrome rather than image.
     if (params.checkerboard != 0u && colour.w < 1.0) {
         const float size = max(params.checkerSize, 1.0);
-        const float2 cell = floor(float2(xy) / size);
+        const float2 cell = floor((float2(xy) + float2(params.checkerOriginX,
+                                                      params.checkerOriginY)) / size);
         const float odd = fmod(cell.x + cell.y, 2.0);
         const float3 checker = lerp(float3(0.18, 0.18, 0.18),
                                     float3(0.28, 0.28, 0.28), odd);

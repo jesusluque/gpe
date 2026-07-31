@@ -84,6 +84,17 @@ struct DisplayControls {
     bool  checkerboard = true;
     float checkerSize = 16.0f;
 
+    /// Where the output sits in whatever the checkerboard should be anchored
+    /// to -- for a viewer, the picture's position in the window, in the same
+    /// pixels and the same direction as the output's own coordinates.
+    ///
+    /// It exists because the alternative is anchoring the pattern to the
+    /// picture, and a picture whose bounding box moves then drags the
+    /// checkerboard along with it. Chrome that slides about as the shot moves
+    /// reads as the shot being unstable.
+    float checkerOriginX = 0.0f;
+    float checkerOriginY = 0.0f;
+
     /// The divider of an A/B wipe, 0..1 across the output. Only read when the
     /// pass is given a second image.
     float wipeAt = 0.5f;

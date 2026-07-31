@@ -31,9 +31,10 @@ struct DisplayUniforms {
     uint32_t srcBWidth = 0;
     uint32_t srcBHeight = 0;
     uint32_t srcBStride = 0;
-    uint32_t pad0 = 0;
+    float    checkerOriginX = 0.0f;
+    float    checkerOriginY = 0.0f;
 };
-static_assert(sizeof(DisplayUniforms) == 80, "no padding, on any compiler");
+static_assert(sizeof(DisplayUniforms) == 84, "no padding, on any compiler");
 
 }   // namespace
 
@@ -157,7 +158,11 @@ void DisplayPass::presentWipe(const Image& source, const Image& right,
             controls.checkerboard ? 1u : 0u, controls.checkerSize,
             wiping ? 1u : 0u, controls.wipeAt,
             static_cast<uint32_t>(other.w), static_cast<uint32_t>(other.h),
-            static_cast<uint32_t>(other.stride), 0});
+            static_cast<uint32_t>(other.stride),
+            // Plus half a pixel, because the caller gives the output's corner
+            // and a shader asks about a pixel's centre. Without it the cell
+            // edges land a pixel out from the same pattern drawn any other way.
+            controls.checkerOriginX + 0.5f, controls.checkerOriginY + 0.5f});
     device_->dispatch(kernel_,
                       Grid{static_cast<uint32_t>(width),
                            static_cast<uint32_t>(height), 1},
