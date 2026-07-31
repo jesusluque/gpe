@@ -64,6 +64,25 @@ public:
 struct DisplayControls {
     float exposure = 0.0f;   ///< stops
     float gamma = 1.0f;      ///< display-referred, after the transform
+
+    /// Which channels reach the screen. The numbering is the viewer's own, so
+    /// that the engine and the interface cannot drift into meaning different
+    /// things by the same number.
+    enum class Channels : uint32_t {
+        Rgb = 0,
+        Red = 1,
+        Green = 2,
+        Blue = 3,
+        Alpha = 4,
+        Luminance = 5,
+    };
+    Channels channels = Channels::Rgb;
+
+    /// A checkerboard behind non-opaque pixels rather than black. Black is
+    /// ambiguous: a matte that is genuinely black and a matte that is missing
+    /// look the same.
+    bool  checkerboard = true;
+    float checkerSize = 16.0f;
 };
 
 }   // namespace gpe

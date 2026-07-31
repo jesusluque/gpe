@@ -303,6 +303,87 @@ int main() {
               "and removing the lattice is not an error");
     }
 
+    // --- channels are isolated before the transform, not after --------------
+    {
+        // A pixel whose channels differ, so isolating one gives a different
+        // answer from isolating another. Isolating *after* the transform would
+        // give the encoded value of the channel rather than the channel through
+        // the transform -- which is what a matte judged against the wrong curve
+        // looks like, and is a mistake nobody notices until they trust it.
+        std::vector<float> plate(size_t{kSrcW} * kSrcH * 4);
+        for (size_t i = 0; i < plate.size(); i += 4) {
+            plate[i + 0] = 0.25f;
+            plate[i + 1] = 0.50f;
+            plate[i + 2] = 0.75f;
+            plate[i + 3] = 1.0f;
+        }
+        device.upload(source, plate.data(), srcBytes);
+
+        const auto isolated = [&](DisplayControls::Channels which) {
+            Capture capture(kSrcW, kSrcH);
+            DisplayControls controls;
+            controls.channels = which;
+            pass.present(Image{source, kSrcW, kSrcH, kSrcW}, capture, controls, 8);
+            return static_cast<int>(capture.at(1, 1, 0));
+        };
+
+        // Each channel encoded through the same curve the picture uses.
+        check(isolated(DisplayControls::Channels::Red) ==
+                  static_cast<int>(srgb(0.25) * 255.0 + 0.5),
+              "red is the red channel through the transform");
+        check(isolated(DisplayControls::Channels::Green) ==
+                  static_cast<int>(srgb(0.50) * 255.0 + 0.5),
+              "green is the green channel");
+        check(isolated(DisplayControls::Channels::Blue) ==
+                  static_cast<int>(srgb(0.75) * 255.0 + 0.5),
+              "blue is the blue channel");
+        check(isolated(DisplayControls::Channels::Alpha) ==
+                  static_cast<int>(srgb(1.0) * 255.0 + 0.5),
+              "alpha is the matte");
+
+        const double luma = 0.2126 * 0.25 + 0.7152 * 0.50 + 0.0722 * 0.75;
+        const int wanted = static_cast<int>(srgb(luma) * 255.0 + 0.5);
+        const int got = isolated(DisplayControls::Channels::Luminance);
+        if (std::abs(got - wanted) > 1) {
+            std::fprintf(stderr, "  luminance: got %d, wanted %d\n", got, wanted);
+        }
+        check(std::abs(got - wanted) <= 1, "and luminance is Rec.709 weighted");
+    }
+
+    // --- the checkerboard is chrome, and goes over the picture --------------
+    {
+        // Transparent everywhere, so what shows is the checker alone. It must
+        // be the two greys as they are -- if it went through the display
+        // transform it would change shade with the view, and chrome that moves
+        // when the view changes is chrome nobody can judge a matte against.
+        std::vector<float> plate(size_t{kSrcW} * kSrcH * 4, 0.0f);
+        device.upload(source, plate.data(), srcBytes);
+
+        Capture capture(kSrcW, kSrcH);
+        DisplayControls controls;
+        controls.checkerboard = true;
+        controls.checkerSize = 16.0f;
+        pass.present(Image{source, kSrcW, kSrcH, kSrcW}, capture, controls, 9);
+
+        // Cell (0,0) is the dark grey, cell (1,0) the light one.
+        const int dark = capture.at(4, 4, 0);
+        const int light = capture.at(20, 4, 0);
+        const auto expectDark = static_cast<int>(0.18 * 255.0 + 0.5);
+        const auto expectLight = static_cast<int>(0.28 * 255.0 + 0.5);
+        if (dark != expectDark || light != expectLight) {
+            std::fprintf(stderr, "  checker: got %d/%d, wanted %d/%d\n", dark,
+                         light, expectDark, expectLight);
+        }
+        check(dark == expectDark && light == expectLight,
+              "the checker is its own two greys, untouched by the transform");
+
+        // And off, a transparent pixel is black rather than checkered.
+        controls.checkerboard = false;
+        Capture plain(kSrcW, kSrcH);
+        pass.present(Image{source, kSrcW, kSrcH, kSrcW}, plain, controls, 10);
+        check(plain.at(4, 4, 0) == 0, "and turning it off leaves black");
+    }
+
     device.release(source);
     device.sync();
 

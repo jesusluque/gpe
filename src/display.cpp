@@ -23,9 +23,13 @@ struct DisplayUniforms {
     uint32_t lutSize = 0;
     float    lutMin = 0.0f;
     float    lutMax = 1.0f;
+    uint32_t channels = 0;
+    uint32_t checkerboard = 0;
+    float    checkerSize = 16.0f;
     uint32_t pad0 = 0;
+    uint32_t pad1 = 0;
 };
-static_assert(sizeof(DisplayUniforms) == 48, "no padding, on any compiler");
+static_assert(sizeof(DisplayUniforms) == 64, "no padding, on any compiler");
 
 }   // namespace
 
@@ -131,7 +135,9 @@ void DisplayPass::present(const Image& source, Presenter& presenter,
             static_cast<uint32_t>(source.stride), static_cast<uint32_t>(width),
             static_cast<uint32_t>(height), static_cast<uint32_t>(width),
             controls.exposure, controls.gamma,
-            static_cast<uint32_t>(lutSize_), lutMin_, lutMax_, 0});
+            static_cast<uint32_t>(lutSize_), lutMin_, lutMax_,
+            static_cast<uint32_t>(controls.channels),
+            controls.checkerboard ? 1u : 0u, controls.checkerSize, 0, 0});
     device_->dispatch(kernel_,
                       Grid{static_cast<uint32_t>(width),
                            static_cast<uint32_t>(height), 1},

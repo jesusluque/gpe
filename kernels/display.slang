@@ -44,7 +44,16 @@ struct DisplayParams {
     /// more display past white.
     float lutMin;
     float lutMax;
+    /// 0 rgb, 1 r, 2 g, 3 b, 4 a, 5 luminance. The same numbering the viewer's
+    /// own shader uses, so the two cannot drift into meaning different things.
+    uint  channels;
+    /// Non-zero to put a checkerboard behind non-opaque pixels rather than
+    /// black. Black is ambiguous: a matte that is genuinely black and a matte
+    /// that is missing look identical.
+    uint  checkerboard;
+    float checkerSize;
     uint  pad0;
+    uint  pad1;
 };
 
 StructuredBuffer<float4>     src;
@@ -141,6 +150,24 @@ void displayMain(uint3 tid: SV_DispatchThreadID) {
     // visibly wrong in the shadows.
     colour = float4(colour.xyz * exp2(params.exposure), colour.w);
 
+    // Channel isolation after exposure and before the transform, which is where
+    // the viewer's own shader does it. Looking at the red channel means looking
+    // at red through the display transform, not at a linear number: a matte
+    // judged in linear is judged against the wrong curve.
+    if (params.channels == 1u) {
+        colour = float4(colour.x, colour.x, colour.x, 1.0);
+    } else if (params.channels == 2u) {
+        colour = float4(colour.y, colour.y, colour.y, 1.0);
+    } else if (params.channels == 3u) {
+        colour = float4(colour.z, colour.z, colour.z, 1.0);
+    } else if (params.channels == 4u) {
+        colour = float4(colour.w, colour.w, colour.w, 1.0);
+    } else if (params.channels == 5u) {
+        // Rec.709 luminance, which is what the working space's primaries are.
+        float luma = dot(colour.xyz, float3(0.2126, 0.7152, 0.0722));
+        colour = float4(luma, luma, luma, 1.0);
+    }
+
     // The baked transform if there is one, the sRGB curve if there is not.
     float3 encoded = params.lutSize >= 2
                          ? sampleLut(colour.xyz)
@@ -150,6 +177,18 @@ void displayMain(uint3 tid: SV_DispatchThreadID) {
         encoded = pow(max(encoded, float3(0.0, 0.0, 0.0)),
                       float3(1.0 / params.gamma, 1.0 / params.gamma,
                              1.0 / params.gamma));
+    }
+
+    // And the checkerboard last, over the transformed picture rather than
+    // under it -- a checker that went through the display transform would
+    // change shade with the view, and it is chrome rather than image.
+    if (params.checkerboard != 0u && colour.w < 1.0) {
+        const float size = max(params.checkerSize, 1.0);
+        const float2 cell = floor(float2(xy) / size);
+        const float odd = fmod(cell.x + cell.y, 2.0);
+        const float3 checker = lerp(float3(0.18, 0.18, 0.18),
+                                    float3(0.28, 0.28, 0.28), odd);
+        encoded = lerp(checker, encoded, colour.w);
     }
 
     dst[pixelIndex(xy, params.dstStride)] =
