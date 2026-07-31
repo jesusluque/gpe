@@ -43,7 +43,7 @@
 #include "gpe/adopt.h"
 #include "gpe/args.h"
 #include "gpe/device.h"
-#include "gpe_kernels.h"
+#include "kernel_registry.h"
 
 namespace gpe {
 namespace {
@@ -236,7 +236,9 @@ public:
                 return static_cast<KernelId>(i + 1);
             }
         }
-        const kernels::Blob* blob = kernels::find(name);
+        // Through the registry, so a kernel a plugin brought with it is
+// found the same way one compiled into this library is.
+        const kernels::Blob* blob = kernels::lookup(name);
         if (blob == nullptr) {
             std::fprintf(stderr, "gpe/metal: no kernel '%.*s' in this binary\n",
                          static_cast<int>(name.size()), name.data());

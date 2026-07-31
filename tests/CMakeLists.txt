@@ -6,10 +6,16 @@ function(gpe_test name)
     target_link_libraries(${name} PRIVATE gpe)
     target_include_directories(${name} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+    # The kernel table is generated at build time and lives with the blobs, so
+    # a test that looks kernels up has to be told where it landed.
+    if(GPE_KERNEL_DIR)
+        target_include_directories(${name} PRIVATE ${GPE_KERNEL_DIR})
+    endif()
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
 gpe_test(test_types)
+gpe_test(test_kernel_registry)
 
 # The viewer test needs Qt, so it exists only where the viewer does.
 if(TARGET gpe_viewer AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_viewer.cpp")

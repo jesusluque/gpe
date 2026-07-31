@@ -72,7 +72,8 @@ elseif(GPE_BACKEND STREQUAL "CUDA" AND
 endif()
 
 if(GPE_SOURCES)
-    add_library(gpe STATIC ${GPE_SOURCES})
+    add_library(gpe STATIC
+    src/kernel_registry.cpp ${GPE_SOURCES})
 else()
     add_library(gpe INTERFACE)
 endif()
