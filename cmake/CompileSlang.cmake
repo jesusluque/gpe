@@ -52,7 +52,7 @@ elseif(GPE_BACKEND STREQUAL "CUDA")
     find_program(GPE_NVCC nvcc HINTS ${CUDAToolkit_BIN_DIR} REQUIRED)
 endif()
 
-set(GPE_KERNEL_DIR "${CMAKE_BINARY_DIR}/kernels")
+set(GPE_KERNEL_DIR "${GPE_BUILD}/kernels")
 file(MAKE_DIRECTORY "${GPE_KERNEL_DIR}")
 
 # gpe_compile_slang(<name> ENTRY <entry>)
@@ -66,14 +66,14 @@ function(gpe_compile_slang name)
         message(FATAL_ERROR "gpe_compile_slang(${name}) needs ENTRY")
     endif()
 
-    set(source "${CMAKE_SOURCE_DIR}/kernels/${name}.slang")
+    set(source "${GPE_ROOT}/kernels/${name}.slang")
     set(blob "${GPE_KERNEL_DIR}/${name}.blob")
 
     # Every kernel imports common.slang, so a change to it has to rebuild all of
     # them. Listed as a dependency rather than globbed: a glob is re-run at
     # configure time and not at build time, which is how a stale kernel survives
     # an edit.
-    set(deps "${source}" "${CMAKE_SOURCE_DIR}/kernels/common.slang")
+    set(deps "${source}" "${GPE_ROOT}/kernels/common.slang")
 
     if(GPE_BACKEND STREQUAL "Metal")
         set(msl "${GPE_KERNEL_DIR}/${name}.metal")
@@ -85,7 +85,7 @@ function(gpe_compile_slang name)
             COMMAND ${GPE_METAL} -c "${msl}" -o "${air}"
             COMMAND ${GPE_METALLIB} "${air}" -o "${blob}"
             DEPENDS ${deps}
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/kernels"
+            WORKING_DIRECTORY "${GPE_ROOT}/kernels"
             COMMENT "slang -> metallib: ${name}"
             VERBATIM)
     elseif(GPE_BACKEND STREQUAL "CUDA")
@@ -100,7 +100,7 @@ function(gpe_compile_slang name)
             COMMAND ${GPE_NVCC} -ptx "${cu}" -o "${blob}"
                     -arch=${GPE_CUDA_ARCH}
             DEPENDS ${deps}
-            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/kernels"
+            WORKING_DIRECTORY "${GPE_ROOT}/kernels"
             COMMENT "slang -> ptx: ${name}"
             VERBATIM)
     else()

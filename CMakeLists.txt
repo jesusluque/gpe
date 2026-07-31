@@ -6,6 +6,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Where this project is, as opposed to whichever project is including it.
+#
+# CMAKE_SOURCE_DIR is the *top* of the build, which is this directory only when
+# gpe is built on its own. Consumed as a subproject it is the consumer's, and
+# every path built from it points at the wrong tree -- which is what happened
+# the first time openFXplayer added gpe, and is the sort of thing only
+# integration finds.
+set(GPE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
+set(GPE_BUILD "${CMAKE_CURRENT_BINARY_DIR}")
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
 endif()
