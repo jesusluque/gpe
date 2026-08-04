@@ -77,6 +77,14 @@ public:
                 if (slot.host != nullptr) {
                     cuMemFreeHost(slot.host);
                 }
+                if (slot.done != nullptr) {
+                    cuEventDestroy(slot.done);
+                }
+            }
+            for (const CUevent done : stagingDone_) {
+                if (done != nullptr) {
+                    cuEventDestroy(done);
+                }
             }
             if (copyDone_ != nullptr) {
                 cuEventDestroy(copyDone_);
@@ -161,6 +169,19 @@ public:
                 return false;
             }
         }
+        // One completion event per staging slot. The ring alone is not the
+        // fix it looks like: a slot is reused after kStagingSlots/2
+        // dispatches, and an async copy reads its pinned source when the
+        // stream reaches it -- under a deep queue the memcpy for a later
+        // dispatch was overwriting bytes a DMA had not yet read. The event
+        // is recorded behind each copy and waited on before the slot is
+        // written again; in the shallow-queue case the wait is a no-op.
+        for (CUevent& done : stagingDone_) {
+            if (!ok(cuEventCreate(&done, CU_EVENT_DISABLE_TIMING),
+                    "eventCreate(staging)")) {
+                return false;
+            }
+        }
         return true;
     }
 
@@ -237,8 +258,13 @@ public:
                 "upload HtoDAsync")) {
             return;
         }
-        // Recorded on the copy stream; the next dispatch waits on it.
+        // Recorded on the copy stream; the next dispatch waits on it, and the
+        // slot's own event guards its pinned buffer against early reuse.
         (void)ok(cuEventRecord(copyDone_, copyStream_), "copyEventRecord");
+        if (lastUploadSlot_ != nullptr && lastUploadSlot_->done != nullptr) {
+            (void)ok(cuEventRecord(lastUploadSlot_->done, copyStream_),
+                     "uploadSlotRecord");
+        }
         uploadPending_ = true;
     }
 
@@ -339,12 +365,18 @@ public:
             const int slot = stagingAt_;
             stagingAt_ = (stagingAt_ + 1) % kStagingSlots;
             uniforms = staging_[slot];
+            // The slot's previous copy must be out of the pinned buffer
+            // before new bytes go in. A never-recorded event answers
+            // immediately, so the first lap costs nothing.
+            (void)ok(cuEventSynchronize(stagingDone_[slot]), "stagingWait");
             std::memcpy(pinned_[slot], view.uniforms, view.uniformBytes);
             if (!ok(cuMemcpyHtoDAsync(uniforms, pinned_[slot], view.uniformBytes,
                                       stream_),
                     "uniforms HtoDAsync")) {
                 return;
             }
+            (void)ok(cuEventRecord(stagingDone_[slot], stream_),
+                     "stagingRecord");
         }
 
         // Then the globals struct: every buffer as {pointer, count}, in the
@@ -380,12 +412,14 @@ public:
         }
         const int slot = stagingAt_;
         stagingAt_ = (stagingAt_ + 1) % kStagingSlots;
+        (void)ok(cuEventSynchronize(stagingDone_[slot]), "stagingWait");
         std::memcpy(pinned_[slot], globals.data(), globals.size());
         if (!ok(cuMemcpyHtoDAsync(kernel.globals, pinned_[slot], globals.size(),
                                   stream_),
                 "globals HtoDAsync")) {
             return;
         }
+        (void)ok(cuEventRecord(stagingDone_[slot], stream_), "stagingRecord");
 
         // Threads to groups. The client asks in threads because that is the
         // number both backends agree about; the rounding up is why every kernel
@@ -512,8 +546,12 @@ private:
     }
 
     struct UploadSlot {
-        void*  host = nullptr;
-        size_t bytes = 0;
+        void*   host = nullptr;
+        size_t  bytes = 0;
+        /// Recorded behind this slot's DMA; waited on before the slot's
+        /// pinned buffer is written again. Same bug and same cure as the
+        /// dispatch staging ring.
+        CUevent done = nullptr;
     };
 
     struct Timing {
@@ -555,6 +593,14 @@ private:
     [[nodiscard]] void* uploadStaging(size_t bytes) {
         UploadSlot& slot = uploads_[uploadAt_];
         uploadAt_ = (uploadAt_ + 1) % kUploadSlots;
+        if (slot.done == nullptr) {
+            (void)ok(cuEventCreate(&slot.done, CU_EVENT_DISABLE_TIMING),
+                     "eventCreate(upload)");
+        } else {
+            // The slot's previous DMA must be done reading before the caller
+            // memcpys new bytes over it.
+            (void)ok(cuEventSynchronize(slot.done), "uploadSlotWait");
+        }
         if (slot.bytes < bytes) {
             if (slot.host != nullptr) {
                 // In flight or not, this is prepare-time: waiting here is
@@ -569,6 +615,7 @@ private:
             }
             slot.bytes = bytes;
         }
+        lastUploadSlot_ = &slot;
         return slot.host;
     }
 
@@ -616,7 +663,9 @@ private:
     CUstream    stream_ = nullptr;
     CUdeviceptr staging_[kStagingSlots]{};
     void*       pinned_[kStagingSlots]{};
+    CUevent     stagingDone_[kStagingSlots]{};
     int         stagingAt_ = 0;
+    UploadSlot* lastUploadSlot_ = nullptr;
     /// This backend's own count, matching the pool's because both increment
     /// once per dispatch and nothing else does.
     uint64_t              submitted_ = 0;
