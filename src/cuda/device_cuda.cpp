@@ -166,7 +166,17 @@ public:
 
     [[nodiscard]] Backend backend() const override { return Backend::CUDA; }
 
+    /// The CUDA context is a per-thread notion and this device is not: images
+    /// are allocated on render threads and pictures prepared on the painting
+    /// thread, by design. Every entry point that touches the driver makes the
+    /// context current first -- a TLS write, idempotent and cheap. Without it
+    /// the first call from a new thread fails with CUDA_ERROR_INVALID_CONTEXT,
+    /// which stayed hidden for as long as discrete cards refused the shared
+    /// context and every caller happened to sit on one thread.
+    void ensureCurrent() const { (void)cuCtxSetCurrent(context_); }
+
     [[nodiscard]] BufferId alloc(size_t bytes) override {
+        ensureCurrent();
         CUdeviceptr ptr = 0;
         if (!ok(cuMemAlloc(&ptr, bytes), "cuMemAlloc")) {
             return kInvalidBuffer;
@@ -179,6 +189,7 @@ public:
     }
 
     void release(BufferId id) override {
+        ensureCurrent();
         if (Allocation* a = find(id); a != nullptr && a->ptr != 0) {
             cuMemFree(a->ptr);
             a->ptr = 0;
@@ -187,6 +198,7 @@ public:
     }
 
     void upload(BufferId id, const void* src, size_t bytes) override {
+        ensureCurrent();
         const Allocation* a = find(id);
         if (a == nullptr || src == nullptr) {
             return;
@@ -231,16 +243,35 @@ public:
     }
 
     void download(void* dst, BufferId id, size_t bytes) override {
+        ensureCurrent();
         const Allocation* a = find(id);
         if (a == nullptr || dst == nullptr) {
             return;
         }
         // The one synchronous call in the interface: it has to be, because the
         // bytes must be there when it returns.
-        (void)ok(cuMemcpyDtoH(dst, a->ptr, bytes), "DtoH");
+        //
+        // Enqueued on the compute stream, not issued as a plain cuMemcpyDtoH.
+        // The plain call synchronises with the *legacy default* stream, and
+        // stream_ is CU_STREAM_NON_BLOCKING -- so the copy engine overtook a
+        // kernel still writing the buffer and handed back the frame from
+        // before it. The display test caught it: the 33-cube LUT won that
+        // race every run and the 65-cube lost it every run, which read as a
+        // size-dependent sampling bug and was nothing of the kind.
+        if (uploadPending_) {
+            // A download straight after an upload, with no dispatch between:
+            // order it behind the copy stream's work too, as dispatch would.
+            (void)ok(cuStreamWaitEvent(stream_, copyDone_, 0), "streamWaitEvent");
+            uploadPending_ = false;
+        }
+        if (!ok(cuMemcpyDtoHAsync(dst, a->ptr, bytes, stream_), "DtoHAsync")) {
+            return;
+        }
+        (void)ok(cuStreamSynchronize(stream_), "downloadSync");
     }
 
     [[nodiscard]] KernelId load(std::string_view name) override {
+        ensureCurrent();
         for (size_t i = 0; i < kernels_.size(); ++i) {
             if (kernels_[i].name == name) {
                 return static_cast<KernelId>(i + 1);
@@ -285,6 +316,7 @@ public:
 
     void dispatch(KernelId id, Grid grid, const void* args,
                   size_t bytes) override {
+        ensureCurrent();
         if (id == kInvalidKernel || id > kernels_.size()) {
             return;
         }
@@ -361,6 +393,22 @@ public:
         const auto groups = [](uint32_t threads, uint32_t size) {
             return (threads + size - 1) / size;
         };
+        // The block takes the grid's shape. Metal launches the exact grid
+        // (dispatchThreads clips the partial group), so a 1D kernel there
+        // never sees a thread with y > 0. CUDA can only round up whole
+        // blocks -- and rounding a 1D grid up to 16x16 blocks launches
+        // sixteen threads for every x, each passing the kernel's x-only
+        // bounds check. The atomics probe counted exactly 16x too many, and
+        // every 1D splat pass was doing its work sixteen times over.
+        //
+        // Two shapes cover the house's two kernel families: image kernels
+        // are 2D, declare 16x16, and the cooperative ones (tile staging,
+        // barriers) rely on exactly that group geometry; the 1D passes
+        // declare 64x1 or 1x1 and cooperate through nothing but atomics, so
+        // a flat block is both correct and fully occupied.
+        const bool     flat = grid.y == 1 && grid.z == 1;
+        const uint32_t blockX = flat ? kGroupX * kGroupY : kGroupX;
+        const uint32_t blockY = flat ? 1 : kGroupY;
         // Compute waits for whatever was uploaded since the last dispatch, and
         // for nothing else. Without this the kernel could read a buffer whose
         // DMA is still running; with a full synchronisation instead, there
@@ -374,9 +422,9 @@ public:
 
         // No kernel parameters at all: Slang puts everything in the
         // __constant__ block, so the launch passes nothing.
-        (void)ok(cuLaunchKernel(kernel.function, groups(grid.x, kGroupX),
-                                groups(grid.y, kGroupY), groups(grid.z, 1),
-                                kGroupX, kGroupY, 1, 0, stream_, nullptr,
+        (void)ok(cuLaunchKernel(kernel.function, groups(grid.x, blockX),
+                                groups(grid.y, blockY), groups(grid.z, 1),
+                                blockX, blockY, 1, 0, stream_, nullptr,
                                 nullptr),
                  "cuLaunchKernel");
 
@@ -411,6 +459,7 @@ public:
     // --- HostStaging -------------------------------------------------------
 
     [[nodiscard]] void* allocHost(size_t bytes) override {
+        ensureCurrent();
         void* memory = nullptr;
         if (!ok(cuMemAllocHost(&memory, bytes), "cuMemAllocHost(ring)")) {
             return nullptr;
@@ -419,6 +468,7 @@ public:
         return memory;
     }
     void freeHost(void* memory) override {
+        ensureCurrent();
         if (memory == nullptr) {
             return;
         }
@@ -432,6 +482,7 @@ public:
     }
 
     void sync() override {
+        ensureCurrent();
         // Both, because a caller asking for everything to be finished means
         // both the work and the transfers.
         (void)ok(cuStreamSynchronize(copyStream_), "copyStreamSync");
