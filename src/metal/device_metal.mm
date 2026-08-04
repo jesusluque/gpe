@@ -329,17 +329,27 @@ public:
         // one. Metal runs handlers on its own thread; reportCompleted stores
         // and returns, which is all a handler is allowed to do.
         const uint64_t submission = ++submitted_;
-        // The std::function overload, named explicitly: metal-cpp also takes an
-        // Objective-C block and a lambda converts to either.
-        const MTL::HandlerFunction handler =
-            [this, submission](MTL::CommandBuffer* done) {
-                // The device's own clock, read off the command buffer. Seconds
-                // since an arbitrary epoch, so only the difference means
-                // anything -- which is all that is wanted.
-                const double seconds = done->GPUEndTime() - done->GPUStartTime();
-                reportCompleted(submission, seconds * 1000.0);
-            };
-        commands->addCompletedHandler(handler);
+        // The **block** overload, not the std::function one.
+        //
+        // metal-cpp's std::function overload copies it into a `__block`
+        // variable and hands Metal a block that reads it back. The copy
+        // helper writes that byref storage on this thread and Metal's own
+        // thread reads it later, and nothing in between is visible to a race
+        // detector -- so every dispatch produced a ThreadSanitizer report
+        // pointing into MTLCommandBuffer.hpp, thirty of them in one suite
+        // run, drowning the two real races found the same afternoon. The
+        // ordering is genuinely there (the copy completes before commit), but
+        // a warning nobody can act on is a warning everybody learns to
+        // ignore. A block captures `this` and the number by value directly:
+        // no byref storage, no std::function, and the noise is gone at the
+        // source rather than suppressed.
+        commands->addCompletedHandler(^(MTL::CommandBuffer* done) {
+            // The device's own clock, read off the command buffer. Seconds
+            // since an arbitrary epoch, so only the difference means
+            // anything -- which is all that is wanted.
+            const double seconds = done->GPUEndTime() - done->GPUStartTime();
+            reportCompleted(submission, seconds * 1000.0);
+        });
 
         // Returns without waiting. `sync` is what waits, and the counter above
         // is what says which submissions have retired without waiting at all.
