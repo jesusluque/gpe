@@ -109,9 +109,11 @@ public:
     void release(BufferId) override;
     void upload(BufferId, const void* src, size_t) override;
     void download(void* dst, BufferId, size_t) override;
+    [[nodiscard]] bool fill(BufferId, uint8_t byte, size_t bytes) override;
     [[nodiscard]] KernelId load(std::string_view name) override;
     void dispatch(KernelId, Grid grid, const void* args, size_t) override;
     void sync() override;
+    void memory(size_t& total, size_t& available) const override;
 
     // --- everything else ---------------------------------------------------
 
@@ -130,6 +132,20 @@ public:
     ///
     /// Not one of the eight, and not on the frame path: this is prepare-time.
     [[nodiscard]] void* allocShared(size_t bytes, BufferId& out);
+
+    /// Page-locked host memory, where the backend can give it.
+    ///
+    /// For a caller that keeps its own pairing of host memory to a device
+    /// buffer -- which is what a discrete card leaves it doing, `allocShared`
+    /// having correctly refused. The transfers between the two are then DMA out
+    /// of pinned pages rather than a staged copy through a bounce buffer, which
+    /// is the difference between a transfer that overlaps with compute and one
+    /// that does not.
+    ///
+    /// Null where the backend has no answer; ordinary memory is then the
+    /// caller's business, and works.
+    [[nodiscard]] void* allocHost(size_t bytes);
+    void freeHost(void* memory);
 
     /// Gives every free buffer back to the driver. Never called on the frame
     /// path -- it is the opposite of what the pool is for.

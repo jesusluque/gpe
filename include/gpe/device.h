@@ -43,6 +43,23 @@ public:
     /// be, because the bytes have to be there when it returns.
     virtual void download(void* dst, BufferId, size_t) = 0;
 
+    /// Writes `byte` over the whole of `bytes`, on the device, copying nothing.
+    ///
+    /// The ninth call, and the one that earns its place: a host that keeps its
+    /// images on the device has to be able to say "this one starts transparent
+    /// black" without sending 33 MB of zeroes over PCIe for every node of every
+    /// frame. That upload is the entire cost this interface exists to avoid,
+    /// and there was no way to express the alternative.
+    ///
+    /// False where the backend cannot, and the caller zeroes host memory and
+    /// uploads it the ordinary way -- which is what it did before this existed.
+    /// Not pure for the same reason: a backend that has no answer keeps
+    /// compiling and keeps working.
+    [[nodiscard]] virtual bool fill(BufferId, uint8_t /*byte*/,
+                                    size_t /*bytes*/) {
+        return false;
+    }
+
     // --- work --------------------------------------------------------------
 
     /// A kernel by name, from the blobs built into the binary. Compiling
@@ -58,6 +75,20 @@ public:
 
     /// Waits for everything queued so far. Once a frame, not once a dispatch.
     virtual void sync() = 0;
+
+    /// How much memory this device has, and how much of it is unspoken for.
+    ///
+    /// Both zero where the backend cannot say, and a caller that gets zero
+    /// falls back to whatever constant it was using before. That constant is
+    /// the problem this answers: a budget chosen for a laptop is a small
+    /// fraction of a 24 GB card, and a host that keeps its pictures on the
+    /// device then starts declining them a third of the way through a
+    /// playback -- quietly, and only under load, which reads as the whole
+    /// optimisation not working rather than as a number set too low.
+    virtual void memory(size_t& total, size_t& available) const {
+        total = 0;
+        available = 0;
+    }
 
     virtual ~Device() = default;
 };

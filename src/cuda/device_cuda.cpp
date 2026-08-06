@@ -296,6 +296,31 @@ public:
         (void)ok(cuStreamSynchronize(stream_), "downloadSync");
     }
 
+    void memory(size_t& total, size_t& available) const override {
+        ensureCurrent();
+        size_t free = 0;
+        size_t all = 0;
+        if (ok(cuMemGetInfo(&free, &all), "cuMemGetInfo")) {
+            total = all;
+            available = free;
+        } else {
+            total = 0;
+            available = 0;
+        }
+    }
+
+    [[nodiscard]] bool fill(BufferId id, uint8_t byte, size_t bytes) override {
+        ensureCurrent();
+        const Allocation* a = find(id);
+        if (a == nullptr || bytes == 0 || bytes > a->bytes) {
+            return false;
+        }
+        // On the compute stream, for the same reason `download` is: a memset
+        // that raced ahead of a kernel still writing the buffer would clear the
+        // picture it had just made, and only sometimes.
+        return ok(cuMemsetD8Async(a->ptr, byte, bytes, stream_), "memsetD8Async");
+    }
+
     [[nodiscard]] KernelId load(std::string_view name) override {
         ensureCurrent();
         for (size_t i = 0; i < kernels_.size(); ++i) {

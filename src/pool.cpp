@@ -297,6 +297,12 @@ void PooledDevice::download(void* dst, BufferId id, size_t bytes) {
     }
 }
 
+bool PooledDevice::fill(BufferId id, uint8_t byte, size_t bytes) {
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    const Slot* slot = resolve(id);
+    return slot != nullptr && native_->fill(slot->native, byte, bytes);
+}
+
 KernelId PooledDevice::load(std::string_view name) { return native_->load(name); }
 
 void PooledDevice::dispatch(KernelId kernel, Grid grid, const void* args,
@@ -420,6 +426,26 @@ void* PooledDevice::allocShared(size_t bytes, BufferId& out) {
 
     out = (static_cast<BufferId>(slot.generation) << kBufferSlotBits) | index;
     return memory;
+}
+
+void PooledDevice::memory(size_t& total, size_t& available) const {
+    native_->memory(total, available);
+}
+
+void* PooledDevice::allocHost(size_t bytes) {
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    auto* staging = dynamic_cast<HostStaging*>(native_.get());
+    return staging != nullptr && bytes != 0 ? staging->allocHost(bytes) : nullptr;
+}
+
+void PooledDevice::freeHost(void* memory) {
+    if (memory == nullptr) {
+        return;
+    }
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    if (auto* staging = dynamic_cast<HostStaging*>(native_.get())) {
+        staging->freeHost(memory);
+    }
 }
 
 void PooledDevice::trim() {
