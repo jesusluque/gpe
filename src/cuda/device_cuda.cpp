@@ -432,6 +432,21 @@ public:
                 entry.data = a->ptr;
                 entry.count = a->bytes / stride;
             }
+            // What the kernel is actually handed, which is not the same
+            // question as what the caller believes it passed -- and the only
+            // place the two can be compared. Behind an environment variable
+            // and a static, so it costs one predicted branch per buffer when
+            // nobody is looking.
+            static const bool trace =
+                std::getenv("GPE_TRACE_BUFFERS") != nullptr;
+            if (trace) {
+                std::fprintf(stderr,
+                             "gpe/cuda: %s slot %u -> %p (%zu, stride %u)\n",
+                             kernel.name.c_str(), i,
+                             reinterpret_cast<void*>(entry.data), entry.count,
+                             view.elementBytes != nullptr ? view.elementBytes[i]
+                                                          : 0);
+            }
             appendBytes(globals, &entry, sizeof(entry));
         }
         appendBytes(globals, &uniforms, sizeof(uniforms));
