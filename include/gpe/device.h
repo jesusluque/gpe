@@ -76,6 +76,29 @@ public:
     /// Waits for everything queued so far. Once a frame, not once a dispatch.
     virtual void sync() = 0;
 
+    /// The backend's own address for a buffer, and the queue it runs on.
+    ///
+    /// FOR ONE KIND OF CALLER ONLY
+    ///
+    /// A third-party runtime that compiles and launches its own work -- an
+    /// inference engine is the case this exists for -- cannot go through
+    /// `dispatch`, because what it has is not a kernel this library loaded. It
+    /// needs the pointer to bind and the stream to enqueue on, and without
+    /// both, the only way to hand it a picture is to copy that picture out and
+    /// back, which on a 24 GB card is the whole point thrown away.
+    ///
+    /// Enqueuing on *this* stream rather than one of its own is what makes the
+    /// ordering free: the work lands behind the kernels that produced its input
+    /// and ahead of the ones that read its output, by the same rule everything
+    /// else here obeys. A caller that takes these and then uses a stream of its
+    /// own has to synchronise by hand, and will get it wrong.
+    ///
+    /// Zero from a backend with no such notion, and the caller has no business
+    /// guessing. `Metal` returns zero for both: a `MTLBuffer` is not an address
+    /// and a command queue is not a stream.
+    [[nodiscard]] virtual uint64_t devicePointer(BufferId) const { return 0; }
+    [[nodiscard]] virtual uint64_t stream() const { return 0; }
+
     /// How much memory this device has, and how much of it is unspoken for.
     ///
     /// Both zero where the backend cannot say, and a caller that gets zero

@@ -296,6 +296,15 @@ public:
         (void)ok(cuStreamSynchronize(stream_), "downloadSync");
     }
 
+    [[nodiscard]] uint64_t devicePointer(BufferId id) const override {
+        const Allocation* a = find(id);
+        return a != nullptr ? static_cast<uint64_t>(a->ptr) : 0;
+    }
+
+    [[nodiscard]] uint64_t stream() const override {
+        return reinterpret_cast<uint64_t>(stream_);
+    }
+
     void memory(size_t& total, size_t& available) const override {
         ensureCurrent();
         size_t free = 0;

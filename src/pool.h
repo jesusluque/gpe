@@ -114,6 +114,10 @@ public:
     void dispatch(KernelId, Grid grid, const void* args, size_t) override;
     void sync() override;
     void memory(size_t& total, size_t& available) const override;
+    /// Resolves the pooled handle first, so a caller that reaches for a stale
+    /// one gets zero rather than somebody else's picture.
+    [[nodiscard]] uint64_t devicePointer(BufferId) const override;
+    [[nodiscard]] uint64_t stream() const override;
 
     // --- everything else ---------------------------------------------------
 
