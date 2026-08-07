@@ -254,8 +254,22 @@ void PooledDevice::release(BufferId id) {
     }
     const uint32_t index = bufferSlot(id);
     slot->live = false;
-    stats_.bytesInUse -= slot->bucketBytes;
     --stats_.liveBuffers;
+
+    if (slot->borrowed) {
+        // Give up the claim and let the backend forget the pointer. Nothing is
+        // freed, nothing goes on a free list, and the slot is recycled at once
+        // -- there is no pending submission to wait for, because the buffer is
+        // not ours to hand out again whatever the device is doing with it.
+        native_->release(slot->native);
+        slot->borrowed = false;
+        slot->native = kInvalidBuffer;
+        slot->bucketBytes = 0;
+        ++slot->generation;
+        recycledSlots_.push_back(index);
+        return;
+    }
+    stats_.bytesInUse -= slot->bucketBytes;
 
     // Not back on the free list yet.
     //
@@ -430,6 +444,37 @@ void* PooledDevice::allocShared(size_t bytes, BufferId& out) {
 
 void PooledDevice::memory(size_t& total, size_t& available) const {
     native_->memory(total, available);
+}
+
+BufferId PooledDevice::adopt(uint64_t devicePtr, size_t bytes) {
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    const BufferId native = native_->adopt(devicePtr, bytes);
+    if (native == kInvalidBuffer) {
+        return kInvalidBuffer;
+    }
+    // Its own slot, never from the free lists and never returned to one. An
+    // adopted buffer has no reuse in it: the memory goes back to whoever owns
+    // it, and a slot that offered it again would hand out a frame the decoder
+    // has since overwritten.
+    uint32_t index = 0;
+    if (!recycledSlots_.empty()) {
+        index = recycledSlots_.back();
+        recycledSlots_.pop_back();
+    } else {
+        index = static_cast<uint32_t>(slots_.size());
+        slots_.emplace_back();
+    }
+    Slot& slot = slots_[index];
+    slot.native = native;
+    slot.bucketBytes = bytes;
+    slot.borrowed = true;
+    ++slot.generation;
+    slot.live = true;
+    ++stats_.liveBuffers;
+    // Deliberately not counted in `bytesInUse` or `bytesHeld`: this is not the
+    // pool's memory and a budget that included it would be measuring somebody
+    // else's allocations against our own ceiling.
+    return (static_cast<BufferId>(slot.generation) << kBufferSlotBits) | index;
 }
 
 uint64_t PooledDevice::devicePointer(BufferId id) const {

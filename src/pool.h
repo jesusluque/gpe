@@ -116,6 +116,13 @@ public:
     void memory(size_t& total, size_t& available) const override;
     /// Resolves the pooled handle first, so a caller that reaches for a stale
     /// one gets zero rather than somebody else's picture.
+    /// Passed through to the backend and given a slot that is never recycled.
+    ///
+    /// A pooled buffer's whole life is being reused; an adopted one has no
+    /// reuse in it -- the memory belongs to somebody who will take it back --
+    /// so it takes a slot, answers while it is live, and the slot is retired
+    /// rather than returned to a free list.
+    [[nodiscard]] BufferId adopt(uint64_t devicePtr, size_t bytes) override;
     [[nodiscard]] uint64_t devicePointer(BufferId) const override;
     [[nodiscard]] uint64_t stream() const override;
 
@@ -222,6 +229,8 @@ private:
         bool     live = false;
         /// Host-visible and owned by the caller, so never recycled.
         bool     shared = false;
+        /// Device memory somebody else owns. Never recycled and never freed.
+        bool     borrowed = false;
     };
 
     struct Retiring {

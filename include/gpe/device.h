@@ -96,6 +96,29 @@ public:
     /// Zero from a backend with no such notion, and the caller has no business
     /// guessing. `Metal` returns zero for both: a `MTLBuffer` is not an address
     /// and a command queue is not a stream.
+    /// Takes a handle to device memory somebody else owns.
+    ///
+    /// For memory that arrives already on the device and is not this engine's
+    /// to allocate or free: a decoder's output frame, a capture card's buffer,
+    /// anything another library hands over. The returned handle behaves like
+    /// any other for reading and dispatching, and releasing it gives up the
+    /// claim without freeing anything -- because freeing it is the owner's job
+    /// and doing it here would take the frame out from under them.
+    ///
+    /// **The lifetime is the caller's problem and it is a short one.** A
+    /// decoder recycles its buffers; a handle adopted from one is only valid
+    /// while whatever kept that buffer alive is still held. Release it before
+    /// letting go of the thing it came from, in that order.
+    ///
+    /// `kInvalidBuffer` from a backend with no notion of a foreign pointer,
+    /// which is every backend but CUDA. A caller that gets one should fall back
+    /// to uploading rather than fail: it is a missing optimisation, not a
+    /// missing capability.
+    [[nodiscard]] virtual BufferId adopt(uint64_t /*devicePtr*/,
+                                         size_t /*bytes*/) {
+        return kInvalidBuffer;
+    }
+
     [[nodiscard]] virtual uint64_t devicePointer(BufferId) const { return 0; }
     [[nodiscard]] virtual uint64_t stream() const { return 0; }
 

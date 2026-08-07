@@ -209,12 +209,24 @@ public:
         return static_cast<BufferId>(buffers_.size());   // 1-based
     }
 
+    [[nodiscard]] BufferId adopt(uint64_t devicePtr, size_t bytes) override {
+        if (devicePtr == 0 || bytes == 0) {
+            return kInvalidBuffer;
+        }
+        buffers_.push_back(
+            Allocation{static_cast<CUdeviceptr>(devicePtr), bytes, true});
+        return static_cast<BufferId>(buffers_.size());
+    }
+
     void release(BufferId id) override {
         ensureCurrent();
         if (Allocation* a = find(id); a != nullptr && a->ptr != 0) {
-            cuMemFree(a->ptr);
+            if (!a->borrowed) {
+                cuMemFree(a->ptr);
+            }
             a->ptr = 0;
             a->bytes = 0;
+            a->borrowed = false;
         }
     }
 
@@ -576,6 +588,10 @@ private:
     struct Allocation {
         CUdeviceptr ptr = 0;
         size_t      bytes = 0;
+        /// Somebody else's memory. Read and dispatched over like any other,
+        /// and never freed here: freeing it would take a frame out from under
+        /// the decoder that is still recycling it.
+        bool        borrowed = false;
     };
     struct HostBlock {
         void*  memory = nullptr;
