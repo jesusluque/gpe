@@ -236,6 +236,20 @@ public:
         if (a == nullptr || src == nullptr) {
             return;
         }
+        // Bounded against the allocation, the way `fill` already was.
+        //
+        // Without it a caller that works out its own byte count wrongly writes
+        // past the end of a device allocation, and nothing anywhere says so:
+        // there is no fault to take, only another buffer's pixels changing. The
+        // pool rounding every size up to a bucket hides most of the small
+        // cases, which makes the ones that survive rarer and no less wrong.
+        if (bytes > a->bytes) {
+            std::fprintf(stderr,
+                         "gpe/cuda: upload of %zu bytes to buffer %llu, which "
+                         "holds %zu\n",
+                         bytes, static_cast<unsigned long long>(id), a->bytes);
+            return;
+        }
         // Already pinned? Then there is nothing to stage.
         //
         // The decode ring hands out memory this backend allocated, so the bytes
@@ -284,6 +298,16 @@ public:
         ensureCurrent();
         const Allocation* a = find(id);
         if (a == nullptr || dst == nullptr) {
+            return;
+        }
+        // Bounded, as upload now is. Reading past the end of an allocation is
+        // the quieter half of the same mistake: it does not corrupt anything on
+        // the device, it just hands the caller whatever was next in memory.
+        if (bytes > a->bytes) {
+            std::fprintf(stderr,
+                         "gpe/cuda: download of %zu bytes from buffer %llu, "
+                         "which holds %zu\n",
+                         bytes, static_cast<unsigned long long>(id), a->bytes);
             return;
         }
         // The one synchronous call in the interface: it has to be, because the
@@ -427,7 +451,14 @@ public:
 
         // Then the globals struct: every buffer as {pointer, count}, in the
         // order the kernel declares them, with the uniform pointer last.
-        std::vector<unsigned char> globals;
+        //
+        // A member, cleared and refilled, rather than a vector built here. A
+        // heap allocation per dispatch is exactly what this file says a
+        // dispatch may not do, and there are several per frame; `clear()` keeps
+        // the capacity, so after the first dispatch of a session there is no
+        // allocation left in this path at all.
+        std::vector<unsigned char>& globals = globals_;
+        globals.clear();
         globals.reserve(kernel.globalsBytes);
         for (uint32_t i = 0; i < view.bufferCount; ++i) {
             const Allocation* a = find(view.buffers[i]);
@@ -637,11 +668,20 @@ private:
     static constexpr uint32_t kGroupX = 16;
     static constexpr uint32_t kGroupY = 16;
 
-    /// Enough for any uniform block a kernel has, and small enough that four of
-    /// them are free. The ring is so that a dispatch does not overwrite the
-    /// uniforms of one still in flight.
+    /// Enough for any uniform block a kernel has, and small enough that a
+    /// dozen of them are free. The ring is so that a dispatch does not
+    /// overwrite the uniforms of one still in flight.
     static constexpr size_t kStagingBytes = 4096;
-    static constexpr int    kStagingSlots = 4;
+    /// Twelve, not four.
+    ///
+    /// Each dispatch takes *two* slots -- uniforms and globals -- and taking
+    /// one waits on that slot's event. Four slots is therefore a margin of two
+    /// dispatches, against a three-frame pipeline with several dispatches in
+    /// each: the wait was not a rare guard against an unusual burst, it was
+    /// hit constantly, on the path this file says may not block. Twelve is six
+    /// dispatches of margin at 48 KB, which is nothing on any card that runs
+    /// this.
+    static constexpr int    kStagingSlots = 12;
     /// Deeper than the three-frame pipeline, so a pair is always finished long
     /// before its slot comes round again.
     static constexpr int    kTimingSlots = 8;
@@ -731,6 +771,9 @@ private:
     CUevent     stagingDone_[kStagingSlots]{};
     int         stagingAt_ = 0;
     UploadSlot* lastUploadSlot_ = nullptr;
+    /// The globals struct being built, kept so that building it allocates
+    /// nothing after the first dispatch. See its use.
+    std::vector<unsigned char> globals_;
     /// This backend's own count, matching the pool's because both increment
     /// once per dispatch and nothing else does.
     uint64_t              submitted_ = 0;

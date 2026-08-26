@@ -48,6 +48,29 @@
 namespace gpe {
 namespace {
 
+/// An autorelease pool for the length of one call.
+///
+/// `commandBuffer()`, `blitCommandEncoder()`, `computeCommandEncoder()` and
+/// `NS::String::string()` all return *autoreleased* objects. In a Cocoa
+/// application the run loop drains them once a turn and nobody thinks about
+/// it; this engine's caller is a render loop that never enters one, so without
+/// a pool of its own every frame leaves a command buffer, two encoders and
+/// their attachments behind -- for as long as the application runs.
+///
+/// One pool per call rather than one per frame: the engine has no notion of a
+/// frame, and a call is the largest scope it can be sure has ended.
+class ScopedPool {
+public:
+    ScopedPool() : pool_(NS::AutoreleasePool::alloc()->init()) {}
+    ~ScopedPool() { pool_->release(); }
+
+    ScopedPool(const ScopedPool&) = delete;
+    ScopedPool& operator=(const ScopedPool&) = delete;
+
+private:
+    NS::AutoreleasePool* pool_;
+};
+
 class MetalDevice final : public Device,
                          public CompletionReporting,
                          public HostStaging {
@@ -65,9 +88,16 @@ public:
             host.buffer->release();
         }
         for (const Staging& slot : uploads_) {
+            if (slot.blit != nullptr) {
+                slot.blit->waitUntilCompleted();
+                slot.blit->release();
+            }
             if (slot.buffer != nullptr) {
                 slot.buffer->release();
             }
+        }
+        if (readback_ != nullptr) {
+            readback_->release();
         }
         if (uploadEvent_ != nullptr) {
             uploadEvent_->release();
@@ -143,6 +173,7 @@ public:
     }
 
     void upload(BufferId id, const void* src, size_t bytes) override {
+        const ScopedPool drain;
         MTL::Buffer** slot = find(id);
         // `*slot` as well as `slot`, which release and download both check and
         // this did not. A released buffer leaves a live slot holding null, and
@@ -187,7 +218,8 @@ public:
         // the staging buffer is what overlaps. A staging buffer allocated per
         // call and released here would also have to be waited for, which is
         // what made this synchronous before.
-        MTL::Buffer* staging = uploadStaging(bytes);
+        int          at = 0;
+        MTL::Buffer* staging = uploadStaging(bytes, at);
         if (staging == nullptr) {
             return;
         }
@@ -200,6 +232,14 @@ public:
         // Signalled here, waited for by the next dispatch and by nothing else.
         commands->encodeSignalEvent(uploadEvent_, ++uploadValue_);
         commands->commit();
+        // Kept on the slot, so the next lap round the ring knows whether this
+        // blit has read the bytes yet. See uploadStaging.
+        if (uploads_[at].blit != nullptr) {
+            uploads_[at].blit->release();
+        }
+        commands->retain();
+        uploads_[at].blit = commands;
+
         if (lastBlit_ != nullptr) {
             lastBlit_->release();
         }
@@ -209,28 +249,104 @@ public:
     }
 
     void download(void* dst, BufferId id, size_t bytes) override {
+        const ScopedPool drain;
         MTL::Buffer** slot = find(id);
-        if (slot == nullptr || dst == nullptr || bytes == 0) {
+        // `*slot`, which upload's comment twenty lines above already said this
+        // one checked, and it did not. A released buffer leaves a live slot
+        // holding null, and null as a blit *source* is the same segmentation
+        // fault inside the driver that upload describes.
+        if (slot == nullptr || *slot == nullptr || dst == nullptr ||
+            bytes == 0) {
             return;
         }
-        MTL::Buffer* staging =
-            device_->newBuffer(bytes, MTL::ResourceStorageModeShared);
-        if (staging == nullptr) {
+        // Reused, not allocated per call. At 4K a display readback is about
+        // 8 MB, and this is the one call the display pass makes every frame --
+        // an allocation and a free per frame in the backend a pool exists to
+        // keep away from the driver.
+        //
+        // Safe to reuse because this call waits: by the time it returns, the
+        // blit that read this buffer has finished.
+        if (readback_ == nullptr || readback_->length() < bytes) {
+            if (readback_ != nullptr) {
+                readback_->release();
+            }
+            readback_ = device_->newBuffer(bytes, MTL::ResourceStorageModeShared);
+        }
+        if (readback_ == nullptr) {
             return;
         }
         MTL::CommandBuffer* commands = queue_->commandBuffer();
+        // Ordered against the transfers, exactly as a dispatch is.
+        //
+        // The uploads go to `blitQueue_` and this reads on `queue_`: two
+        // queues, so without the wait a download issued right after an upload
+        // -- with no dispatch between them to carry the wait -- can overtake it
+        // and return the previous contents. The CUDA side handles the same case
+        // by waiting on its copy event, and says so.
+        if (uploadPending_) {
+            commands->encodeWait(uploadEvent_, uploadValue_);
+            uploadPending_ = false;
+        }
         MTL::BlitCommandEncoder* blit = commands->blitCommandEncoder();
-        blit->copyFromBuffer(*slot, 0, staging, 0, bytes);
+        blit->copyFromBuffer(*slot, 0, readback_, 0, bytes);
         blit->endEncoding();
         commands->commit();
         // The one call in the interface that has to wait: the bytes must be
         // there when it returns.
         commands->waitUntilCompleted();
-        std::memcpy(dst, staging->contents(), bytes);
-        staging->release();
+        std::memcpy(dst, readback_->contents(), bytes);
+    }
+
+    /// Writes `byte` over the whole range, on the device.
+    ///
+    /// Metal has had this since the beginning -- `fillBuffer` on a blit
+    /// encoder -- and the backend simply never offered it, so every "start
+    /// transparent black" on this machine fell back to zeroing host memory and
+    /// sending it across, which for a 4K plate is 135 MB per image that never
+    /// needed to move.
+    ///
+    /// On the blit queue and signalling the upload event, because it is a
+    /// write to a buffer a kernel is about to read: the same ordering an
+    /// upload needs, for the same reason.
+    [[nodiscard]] bool fill(BufferId id, uint8_t byte, size_t bytes) override {
+        const ScopedPool drain;
+        MTL::Buffer** slot = find(id);
+        if (slot == nullptr || *slot == nullptr || bytes == 0) {
+            return false;
+        }
+        if (bytes > (*slot)->length()) {
+            return false;
+        }
+        MTL::CommandBuffer* commands = blitQueue_->commandBuffer();
+        MTL::BlitCommandEncoder* blit = commands->blitCommandEncoder();
+        blit->fillBuffer(*slot, NS::Range::Make(0, bytes), byte);
+        blit->endEncoding();
+        commands->encodeSignalEvent(uploadEvent_, ++uploadValue_);
+        commands->commit();
+        if (lastBlit_ != nullptr) {
+            lastBlit_->release();
+        }
+        commands->retain();
+        lastBlit_ = commands;
+        uploadPending_ = true;
+        return true;
+    }
+
+    /// What the device has, and what is left.
+    ///
+    /// `recommendedMaxWorkingSetSize` rather than physical memory: on unified
+    /// memory the GPU shares the machine's RAM and the physical figure would
+    /// invite a host to budget the whole of it. Apple's recommendation is the
+    /// working set it will let this process hold before it starts paging, which
+    /// is the number a budget wants.
+    void memory(size_t& total, size_t& available) const override {
+        total = static_cast<size_t>(device_->recommendedMaxWorkingSetSize());
+        const size_t used = static_cast<size_t>(device_->currentAllocatedSize());
+        available = used < total ? total - used : 0;
     }
 
     [[nodiscard]] KernelId load(std::string_view name) override {
+        const ScopedPool drain;   // NS::String::string is autoreleased
         for (size_t i = 0; i < kernels_.size(); ++i) {
             if (kernels_[i].name == name) {
                 return static_cast<KernelId>(i + 1);
@@ -283,6 +399,7 @@ public:
 
     void dispatch(KernelId id, Grid grid, const void* args,
                   size_t bytes) override {
+        const ScopedPool drain;
         if (id == kInvalidKernel || id > kernels_.size()) {
             return;
         }
@@ -422,6 +539,8 @@ public:
 private:
     struct Staging {
         MTL::Buffer* buffer = nullptr;
+        /// The blit that last read this slot, retained until it has run.
+        MTL::CommandBuffer* blit = nullptr;
     };
 
     struct HostBuffer {
@@ -458,18 +577,36 @@ private:
         return nullptr;
     }
 
-    [[nodiscard]] MTL::Buffer* uploadStaging(size_t bytes) {
+    [[nodiscard]] MTL::Buffer* uploadStaging(size_t bytes, int& at) {
+        at = uploadAt_;
         Staging& slot = uploads_[uploadAt_];
         uploadAt_ = (uploadAt_ + 1) % kUploadSlots;
+
+        // The blit that last read this slot has to have finished before the
+        // caller memcpys over it.
+        //
+        // Without this the ring was a promise and not a mechanism: a slot comes
+        // round again after kUploadSlots uploads, and with a three-frame
+        // pipeline and more than one upload per frame it comes round while its
+        // blit is still queued -- so the memcpy overwrote bytes a DMA had not
+        // read yet, and the picture that reached the device was half of one
+        // frame and half of another. Load-dependent, size-dependent, and
+        // invisible in anything short of playback.
+        //
+        // The CUDA backend hit exactly this and answered it with an event per
+        // slot; this is the same answer in Metal's vocabulary. It costs
+        // nothing in the steady state, where a slot's blit finished two
+        // uploads ago and the wait returns at once.
+        if (slot.blit != nullptr) {
+            slot.blit->waitUntilCompleted();
+            slot.blit->release();
+            slot.blit = nullptr;
+        }
+
         if (slot.buffer != nullptr && slot.buffer->length() >= bytes) {
             return slot.buffer;
         }
         if (slot.buffer != nullptr) {
-            // Prepare-time, so waiting is allowed -- and releasing a buffer a
-            // blit is reading is not.
-            if (lastBlit_ != nullptr) {
-                lastBlit_->waitUntilCompleted();
-            }
             slot.buffer->release();
         }
         slot.buffer = device_->newBuffer(bytes, MTL::ResourceStorageModeShared);
@@ -497,6 +634,8 @@ private:
     uint64_t            uploadValue_ = 0;
     bool                uploadPending_ = false;
     MTL::CommandBuffer* lastBlit_ = nullptr;
+    /// The readback buffer, grown on demand and kept. See download.
+    MTL::Buffer*        readback_ = nullptr;
     Staging             uploads_[kUploadSlots]{};
     int                 uploadAt_ = 0;
     MTL::CommandBuffer* previous_ = nullptr;
