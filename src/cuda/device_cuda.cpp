@@ -89,6 +89,9 @@ public:
             if (copyDone_ != nullptr) {
                 cuEventDestroy(copyDone_);
             }
+            if (computeDone_ != nullptr) {
+                cuEventDestroy(computeDone_);
+            }
             for (const Timing& timing : timings_) {
                 if (timing.start != nullptr) {
                     cuEventDestroy(timing.start);
@@ -132,13 +135,27 @@ public:
         // not because two threads issued them. One thread issuing to two
         // streams gets the whole of the benefit.
         //
-        // They are ordered where it matters and nowhere else: an event recorded
-        // after an upload, waited on before the next dispatch, so a kernel
-        // never reads a buffer whose bytes are still in flight.
+        // They are ordered where it matters and nowhere else, and it matters in
+        // *both* directions. An event recorded after an upload, waited on before
+        // the next dispatch, so a kernel never reads a buffer whose bytes are
+        // still in flight -- and an event recorded after compute work, waited on
+        // before the next upload, so a DMA never lands in a buffer a memset or a
+        // kernel is about to write.
+        //
+        // Only the first half existed, and the second half is not hypothetical:
+        // `clear()` on a mirrored image memsets the device copy on the compute
+        // stream, and the host's pixels go up on the copy stream. Nothing
+        // ordered the two, so the memset could overtake the upload and wipe the
+        // picture that had just arrived. Measured at five runs in ten, as an
+        // input that reached the kernel as solid black -- and the kernel then
+        // did exactly the right thing with it, which is why it read as a broken
+        // effect rather than a broken transfer.
         if (!ok(cuStreamCreate(&copyStream_, CU_STREAM_NON_BLOCKING),
                 "copyStreamCreate") ||
             !ok(cuEventCreate(&copyDone_, CU_EVENT_DISABLE_TIMING),
-                "copyEventCreate")) {
+                "copyEventCreate") ||
+            !ok(cuEventCreate(&computeDone_, CU_EVENT_DISABLE_TIMING),
+                "computeEventCreate")) {
             return false;
         }
         // Uniforms live in device memory because the generated code reaches
@@ -250,6 +267,10 @@ public:
                          bytes, static_cast<unsigned long long>(id), a->bytes);
             return;
         }
+        // Behind whatever the compute stream was doing, and no further. The
+        // mirror image of the wait in `dispatch`: without it a DMA can land in
+        // a buffer that a memset queued earlier is about to clear.
+        awaitCompute(copyStream_);
         // Already pinned? Then there is nothing to stage.
         //
         // The decode ring hands out memory this backend allocated, so the bytes
@@ -354,6 +375,24 @@ public:
         }
     }
 
+    /// Remembers that the compute stream has work an upload must not overtake.
+    void noteCompute() noexcept {
+        if (computeDone_ != nullptr &&
+            ok(cuEventRecord(computeDone_, stream_), "computeEventRecord")) {
+            computePending_ = true;
+        }
+    }
+
+    /// Orders `into` behind that work, once. Cheap when there is none: the
+    /// whole point is to keep the overlap everywhere it is safe to have.
+    void awaitCompute(CUstream into) noexcept {
+        if (!computePending_) {
+            return;
+        }
+        (void)ok(cuStreamWaitEvent(into, computeDone_, 0), "computeWaitEvent");
+        computePending_ = false;
+    }
+
     [[nodiscard]] bool fill(BufferId id, uint8_t byte, size_t bytes) override {
         ensureCurrent();
         const Allocation* a = find(id);
@@ -363,7 +402,11 @@ public:
         // On the compute stream, for the same reason `download` is: a memset
         // that raced ahead of a kernel still writing the buffer would clear the
         // picture it had just made, and only sometimes.
-        return ok(cuMemsetD8Async(a->ptr, byte, bytes, stream_), "memsetD8Async");
+        if (!ok(cuMemsetD8Async(a->ptr, byte, bytes, stream_), "memsetD8Async")) {
+            return false;
+        }
+        noteCompute();
+        return true;
     }
 
     [[nodiscard]] KernelId load(std::string_view name) override {
@@ -553,6 +596,7 @@ public:
                                 blockX, blockY, 1, 0, stream_, nullptr,
                                 nullptr),
                  "cuLaunchKernel");
+        noteCompute();
 
         // Bracketed by events, so the device times itself.
         //
@@ -782,6 +826,8 @@ private:
     int                   timingAt_ = 0;
     CUstream              copyStream_ = nullptr;
     CUevent               copyDone_ = nullptr;
+    CUevent               computeDone_ = nullptr;
+    bool                  computePending_ = false;
     bool                  uploadPending_ = false;
     std::vector<HostBlock> hostBlocks_;
     UploadSlot            uploads_[kUploadSlots]{};
