@@ -115,6 +115,46 @@ if(NOT GPE_BACKEND STREQUAL "none")
     gpe_compile_slang(scale ENTRY scaleMain)
     gpe_compile_slang(display ENTRY displayMain)
     gpe_write_kernel_header(gpe)
+else()
+    # A table with nothing in it, so the registry still compiles.
+    #
+    # `kernel_registry.cpp` is in the library whatever the backend is, and it
+    # includes the generated header -- so with no backend the build stopped at
+    # `gpe_kernels.h: No such file or directory`, on the one configuration
+    # whose whole point is that a machine without a GPU can still build a
+    # client against this.
+    #
+    # Written here rather than by the generator because it is not the same
+    # header with zero entries: `Blob kAll[]` with no elements is not valid
+    # C++, so the empty case has a shape of its own -- `find` that finds
+    # nothing, which is the truth when nothing was compiled.
+    set(GPE_KERNEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/kernels")
+    file(MAKE_DIRECTORY "${GPE_KERNEL_DIR}")
+    file(WRITE "${GPE_KERNEL_DIR}/gpe_kernels.h"
+"// Generated for a build with no backend. Do not edit.
+#pragma once
+
+#include <cstddef>
+#include <string_view>
+
+namespace gpe::kernels {
+
+/// One compiled kernel, embedded. None were: this build has no backend to
+/// compile them for.
+struct Blob {
+    std::string_view     name;
+    std::string_view     entry;
+    const unsigned char* data;
+    size_t               size;
+};
+
+[[nodiscard]] inline const Blob* find(std::string_view) { return nullptr; }
+
+}   // namespace gpe::kernels
+")
+    if(GPE_SOURCES)
+        target_include_directories(gpe PRIVATE "${GPE_KERNEL_DIR}")
+    endif()
 endif()
 
 # --- viewer -------------------------------------------------------------------

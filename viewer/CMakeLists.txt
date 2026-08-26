@@ -15,9 +15,13 @@ message(STATUS "gpe viewer: Qt ${Qt6_VERSION}")
 # version is pinned here rather than discovered, and moving it is a decision
 # somebody makes on purpose.
 add_library(gpe_viewer STATIC rhi_presenter.cpp)
+# GPE_ROOT, never CMAKE_SOURCE_DIR: consumed as a subproject the latter is the
+# *consumer's* top and this pointed at their tree. It is the same mistake the
+# root CMakeLists spends eight lines warning about, made in the one directory
+# that was written after it.
 target_include_directories(gpe_viewer
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
-           ${CMAKE_SOURCE_DIR}/include)
+           ${GPE_ROOT}/include)
 target_link_libraries(gpe_viewer PUBLIC Qt6::Gui Qt6::GuiPrivate)
 target_compile_features(gpe_viewer PUBLIC cxx_std_20)
 set(GPE_VIEWER_QT_VERSION "${Qt6_VERSION}" CACHE INTERNAL "")

@@ -162,13 +162,49 @@ public:
     /// path -- it is the opposite of what the pool is for.
     void trim();
 
-    [[nodiscard]] Stats stats() const noexcept { return stats_; }
+    /// Under the lock, because the caller is usually a HUD on another thread
+    /// and `alloc`/`release` mutate these counters while it reads them. A torn
+    /// read of a byte count is only a wrong number on a display, but it is a
+    /// data race, and a race that a sanitiser reports on every run buries the
+    /// ones that matter.
+    [[nodiscard]] Stats stats() const {
+        const std::lock_guard<std::recursive_mutex> held(guard_);
+        return stats_;
+    }
 
     /// The backend's completion handler calls this, from whatever thread the
     /// driver runs handlers on. It publishes a number and does nothing else:
     /// no locks, no allocation, no call back into the pool.
+    ///
+    /// **Monotonic**, like `CompletionReporting::reportCompleted` and for one
+    /// reason more than it. Handlers arriving out of order is the reason
+    /// there; here the mark could also be pushed *backwards* by this library's
+    /// own code, and that hung the player for good:
+    ///
+    ///   - `dispatch` counts the submission before handing it to the backend,
+    ///     deliberately, so that a buffer released afterwards belongs to the
+    ///     work that touched it. A backend that then refuses the dispatch --
+    ///     malformed args, a kernel that would not load, a staging copy that
+    ///     failed -- never runs a completion handler for that number, so the
+    ///     reporter stays one behind for the rest of the session.
+    ///   - `sync()` is the escape hatch for exactly that: it stores
+    ///     `submitted_` here, and it is telling the truth, everything really
+    ///     has finished. But it then calls `reclaimLocked()`, which
+    ///     republishes the reporter's lower number -- and as a plain store
+    ///     that undid the rescue one line after it happened.
+    ///
+    /// The mark only climbing makes `sync()` stick, and `FrameArenas::begin`
+    /// can no longer wait forever on a submission that was counted and never
+    /// queued. That wait is untimed on purpose, so backwards was fatal rather
+    /// than slow: the symptom is a player that hangs when it stops, because a
+    /// refused dispatch is most likely to be the last thing a slot saw.
     void notifyCompleted(Submission done) noexcept {
-        completed_.store(done, std::memory_order_release);
+        Submission seen = completed_.load(std::memory_order_relaxed);
+        while (done > seen &&
+               !completed_.compare_exchange_weak(seen, done,
+                                                 std::memory_order_release,
+                                                 std::memory_order_relaxed)) {
+        }
     }
 
     /// The submission a dispatch queued now would belong to.

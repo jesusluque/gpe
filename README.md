@@ -31,6 +31,14 @@ device->sync();                            // once a frame, not once a dispatch
 | `src/pool.cpp`, `src/arena.cpp` | The allocator. `cudaMalloc` synchronises the device implicitly and costs about 100 µs, so an allocation per operation is an allocation per operation too many |
 | `src/player.cpp` | The playback loop: the clock is the truth, frames are dropped, the timeline never slips |
 | `src/display.cpp` | The display pass — transform, downsample and pack on the device, so what crosses to the CPU is the widget-sized 8-bit picture rather than a full-size float plate |
+
+Everything in `src/` is internal today: only `include/gpe/` is on the public
+include path, and `Device::create()` hands back the bare backend. So the pool,
+the arenas, the player and the display pass are gpe's own and not yet a
+consumer's — `device.h` describes the device *as the pool wraps it*, which is
+true inside this library and not true of what `create()` returns. Making that
+surface public, or returning a pooled device from `create()`, is a decision
+that has not been taken.
 | `kernels/*.slang` | Written once in Slang, compiled at build time to PTX or to a Metal library |
 | `viewer/` | The QRhi presenter, on the far side of the `Presenter` interface |
 
