@@ -102,6 +102,9 @@ public:
         if (uploadEvent_ != nullptr) {
             uploadEvent_->release();
         }
+        if (computeEvent_ != nullptr) {
+            computeEvent_->release();
+        }
         if (blitQueue_ != nullptr) {
             blitQueue_->release();
         }
@@ -124,8 +127,9 @@ public:
         queue_ = device_->newCommandQueue();
         blitQueue_ = device_->newCommandQueue();
         uploadEvent_ = device_->newEvent();
+        computeEvent_ = device_->newEvent();
         return queue_ != nullptr && blitQueue_ != nullptr &&
-               uploadEvent_ != nullptr;
+               uploadEvent_ != nullptr && computeEvent_ != nullptr;
     }
 
     [[nodiscard]] bool open() {
@@ -141,8 +145,9 @@ public:
         // gets the whole of the benefit.
         blitQueue_ = device_->newCommandQueue();
         uploadEvent_ = device_->newEvent();
+        computeEvent_ = device_->newEvent();
         return queue_ != nullptr && blitQueue_ != nullptr &&
-               uploadEvent_ != nullptr;
+               uploadEvent_ != nullptr && computeEvent_ != nullptr;
     }
 
     [[nodiscard]] Backend backend() const override { return Backend::Metal; }
@@ -194,6 +199,7 @@ public:
         // memcpy per frame to arrive where they already were.
         if (MTL::Buffer* source = hostBufferFor(src, bytes); source != nullptr) {
             MTL::CommandBuffer* direct = blitQueue_->commandBuffer();
+            awaitCompute(direct);
             MTL::BlitCommandEncoder* encoder = direct->blitCommandEncoder();
             const size_t offset =
                 static_cast<const unsigned char*>(src) -
@@ -226,6 +232,7 @@ public:
         std::memcpy(staging->contents(), src, bytes);
 
         MTL::CommandBuffer* commands = blitQueue_->commandBuffer();
+        awaitCompute(commands);
         MTL::BlitCommandEncoder* blit = commands->blitCommandEncoder();
         blit->copyFromBuffer(staging, 0, *slot, 0, bytes);
         blit->endEncoding();
@@ -330,6 +337,7 @@ public:
         MTL::BlitCommandEncoder* blit = commands->blitCommandEncoder();
         blit->fillBuffer(*slot, NS::Range::Make(0, bytes), byte);
         blit->endEncoding();
+        noteCompute(commands);
         commands->commit();
         // Kept as the last thing on the compute queue, so `sync()` waits for
         // it like it waits for a dispatch.
@@ -450,6 +458,7 @@ public:
         const MTL::Size perGroup = MTL::Size::Make(kGroupX, kGroupY, 1);
         encoder->dispatchThreads(threads, perGroup);
         encoder->endEncoding();
+        noteCompute(commands);
 
         // Numbered before it is committed, so the handler reports the right
         // one. Metal runs handlers on its own thread; reportCompleted stores
@@ -622,6 +631,32 @@ private:
         return slot.buffer;
     }
 
+    /// Remembers that the compute queue has work an upload must not overtake.
+    void noteCompute(MTL::CommandBuffer* commands) {
+        commands->encodeSignalEvent(computeEvent_, ++computeValue_);
+        computePending_ = true;
+    }
+
+    /// Orders a transfer behind that work, once.
+    ///
+    /// The mirror of the wait in `dispatch`, and it is not hypothetical: a
+    /// host that clears an image and then uploads its pixels puts a fill on
+    /// the compute queue and a blit on the transfer queue, and with nothing
+    /// between them the fill can land last and wipe the picture that just
+    /// arrived. The CUDA backend was caught doing exactly this -- five runs in
+    /// ten, reading as an effect that sometimes did nothing, because the kernel
+    /// then blurred the black correctly.
+    ///
+    /// Skipped when the compute queue has nothing outstanding, which is the
+    /// common case during a prepare, so the overlap these two queues exist for
+    /// is kept everywhere it is safe to have.
+    void awaitCompute(MTL::CommandBuffer* commands) {
+        if (computePending_) {
+            commands->encodeWait(computeEvent_, computeValue_);
+            computePending_ = false;
+        }
+    }
+
     [[nodiscard]] MTL::Buffer** find(BufferId id) {
         if (id == kInvalidBuffer || id > buffers_.size()) {
             return nullptr;
@@ -642,6 +677,10 @@ private:
     MTL::Event*         uploadEvent_ = nullptr;
     uint64_t            uploadValue_ = 0;
     bool                uploadPending_ = false;
+    /// The other direction. See awaitCompute.
+    MTL::Event*         computeEvent_ = nullptr;
+    uint64_t            computeValue_ = 0;
+    bool                computePending_ = false;
     MTL::CommandBuffer* lastBlit_ = nullptr;
     /// The readback buffer, grown on demand and kept. See download.
     MTL::Buffer*        readback_ = nullptr;
