@@ -305,9 +305,18 @@ public:
     /// sending it across, which for a 4K plate is 135 MB per image that never
     /// needed to move.
     ///
-    /// On the blit queue and signalling the upload event, because it is a
-    /// write to a buffer a kernel is about to read: the same ordering an
-    /// upload needs, for the same reason.
+    /// On the COMPUTE queue, not the transfer one.
+    ///
+    /// The same rule as the CUDA side, and learned the same way it warns about:
+    /// "a memset that raced ahead of a kernel still writing the buffer would
+    /// clear the picture it had just made, and only sometimes". Put on the blit
+    /// queue this filled buffers that dispatches on the other queue were in the
+    /// middle of writing, and the symptom was a node thumbnail that came out
+    /// black -- the render was right, the clear landed after it.
+    ///
+    /// Queued on `queue_` it is ordered against every kernel by the queue
+    /// itself, which is what the buffer being cleared is about to be used by.
+    /// Nothing to signal and nothing to wait for.
     [[nodiscard]] bool fill(BufferId id, uint8_t byte, size_t bytes) override {
         const ScopedPool drain;
         MTL::Buffer** slot = find(id);
@@ -317,18 +326,18 @@ public:
         if (bytes > (*slot)->length()) {
             return false;
         }
-        MTL::CommandBuffer* commands = blitQueue_->commandBuffer();
+        MTL::CommandBuffer* commands = queue_->commandBuffer();
         MTL::BlitCommandEncoder* blit = commands->blitCommandEncoder();
         blit->fillBuffer(*slot, NS::Range::Make(0, bytes), byte);
         blit->endEncoding();
-        commands->encodeSignalEvent(uploadEvent_, ++uploadValue_);
         commands->commit();
-        if (lastBlit_ != nullptr) {
-            lastBlit_->release();
-        }
+        // Kept as the last thing on the compute queue, so `sync()` waits for
+        // it like it waits for a dispatch.
         commands->retain();
-        lastBlit_ = commands;
-        uploadPending_ = true;
+        if (previous_ != nullptr) {
+            previous_->release();
+        }
+        previous_ = commands;
         return true;
     }
 

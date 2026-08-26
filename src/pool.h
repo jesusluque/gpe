@@ -81,6 +81,17 @@ public:
     struct Stats {
         size_t   bytesHeld = 0;      ///< allocated from the driver, in total
         size_t   bytesInUse = 0;     ///< handed out and not yet released
+        /// What the callers actually asked for, of what is handed out.
+        ///
+        /// The difference against `bytesInUse` is what the size classes cost.
+        /// It is not a rounding error: buckets are powers of two, and a
+        /// 4096-wide float plate is 135 MiB, which is a hair over 128 and so
+        /// takes 256. Television widths land just under a power of two and
+        /// cinema widths just over, so the same policy is free for one and
+        /// half again for the other -- and a host with an image cache is
+        /// sized by what it *holds*, not by what it uses. Reported so that
+        /// deciding what to do about it can be a measurement.
+        size_t   bytesAsked = 0;
         size_t   bytesPending = 0;   ///< released, waiting on a submission
         size_t   liveBuffers = 0;
         uint64_t hits = 0;           ///< allocs served from a free list
@@ -261,6 +272,8 @@ private:
     struct Slot {
         BufferId native = kInvalidBuffer;
         size_t   bucketBytes = 0;
+        /// What was asked for, which is what the bucket was rounded up from.
+        size_t   askedBytes = 0;
         uint32_t generation = 1;   ///< odd while live, even while free
         bool     live = false;
         /// Host-visible and owned by the caller, so never recycled.

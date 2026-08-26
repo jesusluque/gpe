@@ -19,10 +19,28 @@ namespace {
 constexpr size_t kMinBucketBytes = 4096;
 constexpr int    kMinBucketShift = 12;   // 1 << 12 == 4096
 
-/// The largest. 2^40 is a terabyte; no single image allocation approaches it,
-/// and the table is 29 entries either way.
+/// The largest. 2^40 is a terabyte; no single image allocation approaches it.
 constexpr int kMaxBucketShift = 40;
-constexpr int kBucketCount = kMaxBucketShift - kMinBucketShift + 1;
+/// Steps within one doubling: 1, 1.25, 1.5, 1.75.
+///
+/// WHY NOT POWERS OF TWO
+///
+/// Because of what a plate is. A float32 RGBA image is width x height x 16,
+/// and cinema widths sit just above a power of two where television widths sit
+/// just below: 3840 wide is 126.6 MiB and takes the 128 MiB class, while 4096
+/// wide is 135.0 MiB and takes 256. Measured on an L4 over a six-node chain,
+/// the same graph held 2432 MiB for 2405 asked at UHD -- and 4864 MiB for 2565
+/// at 4K DCI. Ninety per cent overhead, on the format a feature is finished in,
+/// and invisible in every other figure: the cache reports what it believes it
+/// holds, not what the device gave up for it.
+///
+/// Quarters cost nothing to compute and no bookkeeping worth the name: the
+/// table is four times as long, which is 116 entries of a vector of vectors.
+/// What they buy is that no size is ever charged more than a quarter over, and
+/// the two DCI formats land within twenty per cent instead of ninety.
+constexpr int kStepsPerDouble = 4;
+constexpr int kBucketCount =
+    (kMaxBucketShift - kMinBucketShift) * kStepsPerDouble + 1;
 
 }   // namespace
 
@@ -30,13 +48,24 @@ int PooledDevice::bucketFor(size_t bytes) noexcept {
     if (bytes <= kMinBucketBytes) {
         return 0;
     }
-    // The power of two at or above `bytes`. bit_width(n-1) is that exponent.
-    const int shift = std::bit_width(bytes - 1);
-    return std::min(shift - kMinBucketShift, kBucketCount - 1);
+    // The doubling this falls in, then the quarter within it. bit_width(n-1)-1
+    // is the exponent at or below `bytes`.
+    const int shift = std::bit_width(bytes - 1) - 1;
+    const size_t floor = size_t{1} << shift;
+    const size_t step = floor / kStepsPerDouble;
+    // How many quarter-steps above `floor`, rounded up. `bytes` is above
+    // `floor` by construction and at most one whole doubling above it.
+    const int within =
+        static_cast<int>((bytes - floor + step - 1) / step);
+    const int bucket = (shift - kMinBucketShift) * kStepsPerDouble + within;
+    return std::min(std::max(bucket, 0), kBucketCount - 1);
 }
 
 size_t PooledDevice::bucketBytes(int bucket) noexcept {
-    return size_t{1} << (bucket + kMinBucketShift);
+    const int shift = bucket / kStepsPerDouble + kMinBucketShift;
+    const int within = bucket % kStepsPerDouble;
+    const size_t floor = size_t{1} << shift;
+    return floor + (floor / kStepsPerDouble) * static_cast<size_t>(within);
 }
 
 PooledDevice::PooledDevice(std::unique_ptr<Device> native, size_t budgetBytes,
@@ -240,7 +269,9 @@ BufferId PooledDevice::alloc(size_t bytes) {
     // answer to it.
     ++slot.generation;
     slot.live = true;
+    slot.askedBytes = bytes;
     stats_.bytesInUse += slot.bucketBytes;
+    stats_.bytesAsked += bytes;
     ++stats_.liveBuffers;
 
     return (static_cast<BufferId>(slot.generation) << kBufferSlotBits) | index;
@@ -270,6 +301,7 @@ void PooledDevice::release(BufferId id) {
         return;
     }
     stats_.bytesInUse -= slot->bucketBytes;
+    stats_.bytesAsked -= slot->askedBytes;
 
     // Not back on the free list yet.
     //
