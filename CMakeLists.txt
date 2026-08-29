@@ -39,9 +39,53 @@ else()
 endif()
 message(STATUS "gpe backend: ${GPE_BACKEND}")
 
-# The card the PTX is generated for. sm_89 is Ada -- the L4 on the build
-# machine. PTX is forward compatible, so this is a floor and not a ceiling.
-set(GPE_CUDA_ARCH "sm_89" CACHE STRING "virtual architecture for nvcc -ptx")
+# The card the PTX is generated for.
+#
+# A floor and not a ceiling: PTX built for one virtual architecture runs on that
+# one and everything above it, and the driver JITs the difference. Which is
+# exactly why a hardcoded sm_89 was the wrong default -- Ada is a high floor,
+# and every card below it, an Ampere laptop included, answers
+# cuModuleLoadData with CUDA_ERROR_INVALID_PTX. Every kernel in the build
+# failed to load, on a machine whose GPU worked perfectly.
+#
+# So the default is what this machine actually has, asked of the driver, and
+# nvidia-smi is the right thing to ask: it ships with the driver, and a machine
+# with no driver has nothing to run the PTX on either. An explicit
+# -DGPE_CUDA_ARCH still wins, which is what a build that has to *ship* a bundle
+# wants -- an embedded blob compiled for the machine that built it is a plugin
+# that refuses to load on an older card, and choosing that floor is a decision
+# somebody should make on purpose rather than inherit from a build host.
+set(GPE_CUDA_ARCH_DEFAULT "sm_89")
+if(NOT DEFINED GPE_CUDA_ARCH)
+    find_program(GPE_NVIDIA_SMI nvidia-smi)
+    if(GPE_NVIDIA_SMI)
+        execute_process(
+            COMMAND "${GPE_NVIDIA_SMI}" --query-gpu=compute_cap --format=csv,noheader
+            OUTPUT_VARIABLE _caps RESULT_VARIABLE _asked
+            OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        # The first line: one card is the ordinary case, and with two the PTX
+        # has to clear the lower of them, which is the first only by luck --
+        # so the lowest is taken rather than the first.
+        if(_asked EQUAL 0 AND _caps)
+            string(REPLACE "\n" ";" _caps "${_caps}")
+            set(_lowest "")
+            foreach(_cap IN LISTS _caps)
+                string(STRIP "${_cap}" _cap)
+                string(REPLACE "." "" _cap "${_cap}")
+                if(_cap MATCHES "^[0-9]+$")
+                    if(_lowest STREQUAL "" OR _cap LESS _lowest)
+                        set(_lowest "${_cap}")
+                    endif()
+                endif()
+            endforeach()
+            if(_lowest)
+                set(GPE_CUDA_ARCH_DEFAULT "sm_${_lowest}")
+            endif()
+        endif()
+    endif()
+endif()
+set(GPE_CUDA_ARCH "${GPE_CUDA_ARCH_DEFAULT}" CACHE STRING
+    "virtual architecture for nvcc -ptx; a floor, so the lowest card it must run on")
 
 # --- the library --------------------------------------------------------------
 #
