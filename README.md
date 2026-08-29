@@ -57,8 +57,14 @@ ctest --test-dir build
 The backend is decided by the machine and nowhere else: Metal on Apple, CUDA
 where `nvcc` is found, and `none` otherwise — in which case `gpe` is still a
 target and still compiles clients, it just has no device to give them.
-`GPE_CUDA_ARCH` (default `sm_89`, an Ada card) is a floor rather than a
-ceiling, because PTX is forward compatible.
+`GPE_CUDA_ARCH` is a floor rather than a ceiling, because PTX is forward
+compatible: it runs on the architecture it was built for and everything above
+it. The default is what this machine has, asked of `nvidia-smi` and clamped to
+what `nvcc` can build for — the lowest card if there are several, since the
+floor has to clear all of them. Set it explicitly for a build that has to
+*ship*: a blob compiled for the machine that built it is a plugin that refuses
+to load on an older card, and that floor should be chosen on purpose rather
+than inherited from a build host.
 
 `environment.yml` pins the build toolchain — conda-forge only — so two machines
 building the same commit use the same CMake and the same Ninja.

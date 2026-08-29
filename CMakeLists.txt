@@ -63,9 +63,9 @@ if(NOT DEFINED GPE_CUDA_ARCH)
             COMMAND "${GPE_NVIDIA_SMI}" --query-gpu=compute_cap --format=csv,noheader
             OUTPUT_VARIABLE _caps RESULT_VARIABLE _asked
             OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-        # The first line: one card is the ordinary case, and with two the PTX
-        # has to clear the lower of them, which is the first only by luck --
-        # so the lowest is taken rather than the first.
+        # One card is the ordinary case. With two, the PTX has to clear the
+        # lower of them, and the one nvidia-smi lists first is that only by
+        # luck -- so the lowest is taken rather than the first.
         if(_asked EQUAL 0 AND _caps)
             string(REPLACE "\n" ";" _caps "${_caps}")
             set(_lowest "")
@@ -80,6 +80,57 @@ if(NOT DEFINED GPE_CUDA_ARCH)
             endforeach()
             if(_lowest)
                 set(GPE_CUDA_ARCH_DEFAULT "sm_${_lowest}")
+            endif()
+        endif()
+    endif()
+
+    # ...and then clamped to what this nvcc can build for, which is not the
+    # same question.
+    #
+    # A card newer than the toolkit is the ordinary case for the first months
+    # of a generation, and asking for an architecture nvcc has never heard of
+    # is `nvcc fatal : Unsupported gpu architecture` -- every kernel in the
+    # build failing to compile, which is the same total failure the wrong floor
+    # gave and arrives by the opposite road. Clamping down is safe and is the
+    # whole point of a floor: PTX for compute_90 runs on an sm_120 card, the
+    # driver JITs the difference.
+    #
+    # Clamping *up* -- a card older than the toolkit's minimum, which newer
+    # CUDA versions do drop -- produces PTX that card cannot run. There is
+    # nothing better available, so it is done and said out loud rather than
+    # left to fail at load time with CUDA_ERROR_INVALID_PTX and no explanation.
+    if(CMAKE_CUDA_COMPILER)
+        execute_process(
+            COMMAND "${CMAKE_CUDA_COMPILER}" --list-gpu-arch
+            OUTPUT_VARIABLE _known RESULT_VARIABLE _asked
+            OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        # `--list-gpu-arch` arrived in CUDA 11.1. An older nvcc answers
+        # non-zero and this is skipped, which is where this started.
+        if(_asked EQUAL 0 AND _known)
+            string(REGEX MATCHALL "compute_([0-9]+)" _known "${_known}")
+            set(_supported "")
+            foreach(_one IN LISTS _known)
+                string(REGEX REPLACE "compute_" "" _one "${_one}")
+                list(APPEND _supported "${_one}")
+            endforeach()
+            list(SORT _supported COMPARE NATURAL)
+            if(_supported)
+                list(GET _supported 0 _floor)
+                list(GET _supported -1 _ceiling)
+                string(REGEX REPLACE "^sm_" "" _wanted "${GPE_CUDA_ARCH_DEFAULT}")
+                if(_wanted GREATER _ceiling)
+                    message(STATUS
+                        "CUDA: this card is sm_${_wanted} and this nvcc stops "
+                        "at compute_${_ceiling}; building for the latter, "
+                        "which the card runs")
+                    set(GPE_CUDA_ARCH_DEFAULT "sm_${_ceiling}")
+                elseif(_wanted LESS _floor)
+                    message(WARNING
+                        "CUDA: this card is sm_${_wanted} and this nvcc starts "
+                        "at compute_${_floor}; building for the latter, which "
+                        "this card cannot run -- the toolkit has dropped it")
+                    set(GPE_CUDA_ARCH_DEFAULT "sm_${_floor}")
+                endif()
             endif()
         endif()
     endif()
