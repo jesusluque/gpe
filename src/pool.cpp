@@ -414,11 +414,19 @@ void PooledDevice::sync() {
     reclaimLocked();
 }
 
+void PooledDevice::flush() {
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    native_->flush();
+}
+
 void PooledDevice::waitFor(Submission at) {
     reclaim();
     if (retired(at)) {
         return;
     }
+    // A backend holding the submission back in a batch would never report it:
+    // hand it over first, or every wait is a spin and a full sync.
+    flush();
     // Long enough for work that is nearly done to land, short enough not to
     // burn a core on a backend that will never publish anything.
     for (int spins = 0; spins < 10000; ++spins) {

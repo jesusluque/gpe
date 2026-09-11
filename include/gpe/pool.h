@@ -128,6 +128,7 @@ public:
     [[nodiscard]] KernelId load(std::string_view name) override;
     void dispatch(KernelId, Grid grid, const void* args, size_t) override;
     void sync() override;
+    void flush() override;
     void memory(size_t& total, size_t& available) const override;
     /// Resolves the pooled handle first, so a caller that reaches for a stale
     /// one gets zero rather than somebody else's picture.

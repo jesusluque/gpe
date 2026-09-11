@@ -85,6 +85,13 @@ class MetalDevice final : public Device,
                          public HostStaging {
 public:
     ~MetalDevice() override {
+        sync();
+        if (previous_ != nullptr) {
+            previous_->release();
+        }
+        if (lastBlit_ != nullptr) {
+            lastBlit_->release();
+        }
         for (MTL::Buffer* buffer : buffers_) {
             if (buffer != nullptr) {
                 buffer->release();
@@ -235,6 +242,7 @@ public:
         // Copying them into a second shared buffer first would be 33 MB of
         // memcpy per frame to arrive where they already were.
         if (MTL::Buffer* source = hostBufferFor(src, bytes); source != nullptr) {
+            flushBatch();
             MTL::CommandBuffer* direct = blitQueue_->commandBuffer();
             awaitCompute(direct);
             MTL::BlitCommandEncoder* encoder = direct->blitCommandEncoder();
@@ -268,6 +276,7 @@ public:
         }
         std::memcpy(staging->contents(), src, bytes);
 
+        flushBatch();
         MTL::CommandBuffer* commands = blitQueue_->commandBuffer();
         awaitCompute(commands);
         MTL::BlitCommandEncoder* blit = commands->blitCommandEncoder();
@@ -319,6 +328,7 @@ public:
         if (readback_ == nullptr) {
             return;
         }
+        flushBatch();
         MTL::CommandBuffer* commands = queue_->commandBuffer();
         // Ordered against the transfers, exactly as a dispatch is.
         //
@@ -370,6 +380,7 @@ public:
         if (bytes > (*slot)->length()) {
             return false;
         }
+        flushBatch();
         MTL::CommandBuffer* commands = queue_->commandBuffer();
         MTL::BlitCommandEncoder* blit = commands->blitCommandEncoder();
         blit->fillBuffer(*slot, NS::Range::Make(0, bytes), byte);
@@ -487,16 +498,14 @@ public:
             }
         }
 
-        MTL::CommandBuffer* commands = queue_->commandBuffer();
-        // Wait for whatever was uploaded since the last dispatch, and for
-        // nothing else. Without it a kernel could read a buffer whose blit is
-        // still running; with a full wait instead there would be no overlap
-        // left to have.
-        if (uploadPending_) {
-            commands->encodeWait(uploadEvent_, uploadValue_);
-            uploadPending_ = false;
+        // Uploads issued since the batch opened must land before this
+        // kernel, and a wait can only be encoded before a command buffer's
+        // first encoder: so the batch that cannot carry it goes now.
+        if (batch_ != nullptr && uploadPending_) {
+            flushBatch();
         }
-        MTL::ComputeCommandEncoder* encoder = commands->computeCommandEncoder();
+        openBatch();
+        MTL::ComputeCommandEncoder* encoder = batchEncoder_;
         encoder->setComputePipelineState(kernel.pipeline);
 
         for (uint32_t i = 0; i < view.bufferCount; ++i) {
@@ -536,43 +545,18 @@ public:
             const MTL::Size perGroup = MTL::Size::Make(kGroupX, kGroupY, 1);
             encoder->dispatchThreads(threads, perGroup);
         }
-        encoder->endEncoding();
-        noteCompute(commands);
-
-        // Numbered before it is committed, so the handler reports the right
-        // one. Metal runs handlers on its own thread; reportCompleted stores
-        // and returns, which is all a handler is allowed to do.
-        const uint64_t submission = ++submitted_;
-        // The **block** overload, not the std::function one.
-        //
-        // metal-cpp's std::function overload copies it into a `__block`
-        // variable and hands Metal a block that reads it back. The copy
-        // helper writes that byref storage on this thread and Metal's own
-        // thread reads it later, and nothing in between is visible to a race
-        // detector -- so every dispatch produced a ThreadSanitizer report
-        // pointing into MTLCommandBuffer.hpp, thirty of them in one suite
-        // run, drowning the two real races found the same afternoon. The
-        // ordering is genuinely there (the copy completes before commit), but
-        // a warning nobody can act on is a warning everybody learns to
-        // ignore. A block captures `this` and the number by value directly:
-        // no byref storage, no std::function, and the noise is gone at the
-        // source rather than suppressed.
-        commands->addCompletedHandler(^(MTL::CommandBuffer* done) {
-            // The device's own clock, read off the command buffer. Seconds
-            // since an arbitrary epoch, so only the difference means
-            // anything -- which is all that is wanted.
-            const double seconds = done->GPUEndTime() - done->GPUStartTime();
-            reportCompleted(submission, seconds * 1000.0);
-        });
-
-        // Returns without waiting. `sync` is what waits, and the counter above
-        // is what says which submissions have retired without waiting at all.
-        commands->commit();
-        commands->retain();
-        if (previous_ != nullptr) {
-            previous_->release();
+        // Numbered now, reported when the batch it is in completes: the
+        // pool's rule is "everything up to N", which a batch satisfies for
+        // its last number.
+        batchLast_ = ++submitted_;
+        if (++batched_ >= kBatchLimit) {
+            flushBatch();
         }
-        previous_ = commands;
+    }
+
+    void flush() override {
+        const ScopedPool drain;
+        flushBatch();
     }
 
     // --- HostStaging -------------------------------------------------------
@@ -645,6 +629,7 @@ public:
             }
             return;
         }
+        flushBatch();
         MTL::CommandBuffer* commands = queue_->commandBuffer();
         if (uploadPending_) {
             commands->encodeWait(uploadEvent_, uploadValue_);
@@ -677,6 +662,10 @@ public:
     }
 
     void sync() override {
+        {
+            const ScopedPool drain;
+            flushBatch();
+        }
         // Both queues: a caller asking for everything to be finished means the
         // transfers as well as the work.
         if (lastBlit_ != nullptr) {
@@ -766,6 +755,71 @@ private:
         return slot.buffer;
     }
 
+    /// BATCHING
+    ///
+    /// Dispatches are encoded into one open command buffer and committed
+    /// together, not one command buffer each. Measured on an M5 Pro, 2000
+    /// small dispatches: a command buffer, encoder, completion block and
+    /// commit apiece cost 12-15 us of CPU per dispatch, nearly all of the
+    /// time; batched, about 1 us to queue and 3.5 us including the device's
+    /// work (tests/test_dispatch_order.cpp).
+    ///
+    /// The batch goes -- is committed, never waited for -- at every point
+    /// something must run after what it holds: an upload (which orders itself
+    /// behind compute), a download, a fill, sync(), flush(), a dispatch that
+    /// must wait for an upload, and every kBatchLimit dispatches so that work
+    /// keeps flowing to the device inside a long frame. A host that shares
+    /// this queue with another runtime calls flush() before that runtime
+    /// submits work reading gpe's results.
+    void openBatch() {
+        if (batch_ != nullptr) {
+            return;
+        }
+        batch_ = queue_->commandBuffer()->retain();
+        // Wait for whatever was uploaded since the last batch, and for nothing
+        // else. Without it a kernel could read a buffer whose blit is still
+        // running; with a full wait instead there would be no overlap left.
+        if (uploadPending_) {
+            batch_->encodeWait(uploadEvent_, uploadValue_);
+            uploadPending_ = false;
+        }
+        batchEncoder_ = batch_->computeCommandEncoder()->retain();
+    }
+
+    void flushBatch() {
+        if (batch_ == nullptr) {
+            return;
+        }
+        batchEncoder_->endEncoding();
+        batchEncoder_->release();
+        batchEncoder_ = nullptr;
+        noteCompute(batch_);
+        const uint64_t submission = batchLast_;
+        // The **block** overload, not the std::function one.
+        //
+        // metal-cpp's std::function overload copies it into a `__block`
+        // variable and hands Metal a block that reads it back. The copy
+        // helper writes that byref storage on this thread and Metal's own
+        // thread reads it later, and nothing in between is visible to a race
+        // detector -- so every dispatch produced a ThreadSanitizer report
+        // pointing into MTLCommandBuffer.hpp. A block captures `this` and the
+        // number by value directly: no byref storage, no std::function.
+        batch_->addCompletedHandler(^(MTL::CommandBuffer* done) {
+            // The device's own clock, read off the command buffer: the whole
+            // batch, which is what a frame's dispatches are.
+            const double seconds = done->GPUEndTime() - done->GPUStartTime();
+            reportCompleted(submission, seconds * 1000.0);
+        });
+        // Returns without waiting. `sync` is what waits.
+        batch_->commit();
+        if (previous_ != nullptr) {
+            previous_->release();
+        }
+        previous_ = batch_;   // already retained
+        batch_ = nullptr;
+        batched_ = 0;
+    }
+
     /// Remembers that the compute queue has work an upload must not overtake.
     void noteCompute(MTL::CommandBuffer* commands) {
         commands->encodeSignalEvent(computeEvent_, ++computeValue_);
@@ -822,6 +876,12 @@ private:
     Staging             uploads_[kUploadSlots]{};
     int                 uploadAt_ = 0;
     MTL::CommandBuffer* previous_ = nullptr;
+    /// The open batch. See openBatch.
+    MTL::CommandBuffer*         batch_ = nullptr;
+    MTL::ComputeCommandEncoder* batchEncoder_ = nullptr;
+    uint32_t                    batched_ = 0;
+    uint64_t                    batchLast_ = 0;
+    static constexpr uint32_t   kBatchLimit = 64;
     /// This backend's own count, which matches the pool's because both
     /// increment once per dispatch and nothing else.
     uint64_t            submitted_ = 0;

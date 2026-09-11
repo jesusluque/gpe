@@ -77,6 +77,16 @@ public:
     /// Waits for everything queued so far. Once a frame, not once a dispatch.
     virtual void sync() = 0;
 
+    /// Hands everything queued so far to the device, without waiting.
+    ///
+    /// A backend may hold several dispatches back to submit them together
+    /// (Metal does: one command buffer, not one each). Everything this
+    /// interface does that must follow them -- upload, download, fill, sync --
+    /// already flushes. What cannot is another runtime submitting on the same
+    /// queue (`backendQueue`, adopt.h): call this before it reads what gpe
+    /// wrote. A backend that submits each dispatch at once has nothing to do.
+    virtual void flush() {}
+
     /// The backend's own address for a buffer, and the queue it runs on.
     ///
     /// FOR ONE KIND OF CALLER ONLY
