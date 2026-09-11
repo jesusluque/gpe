@@ -517,6 +517,28 @@ uint64_t PooledDevice::devicePointer(BufferId id) const {
 
 uint64_t PooledDevice::stream() const { return native_->stream(); }
 
+uint64_t PooledDevice::backendBuffer(BufferId id) const {
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    const Slot* slot = resolve(id);
+    return slot != nullptr ? native_->backendBuffer(slot->native) : 0;
+}
+
+uint64_t PooledDevice::backendDevice() const { return native_->backendDevice(); }
+uint64_t PooledDevice::backendQueue() const { return native_->backendQueue(); }
+
+void PooledDevice::downloadAsync(BufferId id, void* dst, size_t bytes,
+                                 std::function<void(bool)> done) {
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    const Slot* slot = resolve(id);
+    if (slot == nullptr) {
+        if (done) {
+            done(false);
+        }
+        return;
+    }
+    native_->downloadAsync(slot->native, dst, bytes, std::move(done));
+}
+
 void* PooledDevice::allocHost(size_t bytes) {
     const std::lock_guard<std::recursive_mutex> held(guard_);
     auto* staging = dynamic_cast<HostStaging*>(native_.get());

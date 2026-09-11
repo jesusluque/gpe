@@ -34,6 +34,11 @@ if(NOT GPE_BACKEND STREQUAL "none")
     target_include_directories(test_kernels PRIVATE "${GPE_KERNEL_DIR}")
 endif()
 
+if(NOT GPE_BACKEND STREQUAL "none")
+    gpe_test(test_kernel_info)
+    add_dependencies(test_kernel_info gpe_kernels)
+endif()
+
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_pool.cpp")
     gpe_test(test_pool)
 endif()

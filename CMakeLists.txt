@@ -188,6 +188,12 @@ if(GPE_SOURCES)
         # without a trip to developer.apple.com.
         target_include_directories(gpe PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/third_party/metal-cpp)
+        option(GPE_METAL_CPP_IMPLEMENTATION
+               "Define metal-cpp's selector tables in gpe (off when another library in the program does)"
+               ON)
+        if(NOT GPE_METAL_CPP_IMPLEMENTATION)
+            target_compile_definitions(gpe PRIVATE GPE_NO_METAL_CPP_IMPLEMENTATION=1)
+        endif()
     elseif(GPE_BACKEND STREQUAL "CUDA")
         find_package(CUDAToolkit REQUIRED)
         # The driver API, not the runtime: the kernels are PTX in a blob and
@@ -209,6 +215,7 @@ if(NOT GPE_BACKEND STREQUAL "none")
     include(CompileSlang)
     gpe_compile_slang(scale ENTRY scaleMain)
     gpe_compile_slang(display ENTRY displayMain)
+    gpe_compile_slang(iota ENTRY iotaMain)
     gpe_write_kernel_header(gpe)
 else()
     # A table with nothing in it, so the registry still compiles.
