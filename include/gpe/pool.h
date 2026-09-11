@@ -130,6 +130,7 @@ public:
     void sync() override;
     void flush() override;
     void memory(size_t& total, size_t& available) const override;
+    void bindThread() const override;
     /// Resolves the pooled handle first, so a caller that reaches for a stale
     /// one gets zero rather than somebody else's picture.
     /// Passed through to the backend and given a slot that is never recycled.

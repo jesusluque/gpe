@@ -236,6 +236,10 @@ public:
     /// context and every caller happened to sit on one thread.
     void ensureCurrent() const { (void)cuCtxSetCurrent(context_); }
 
+    /// The same TLS write, for a caller that is about to reach this context
+    /// through the API that made it rather than through gpe.
+    void bindThread() const override { ensureCurrent(); }
+
     [[nodiscard]] BufferId alloc(size_t bytes) override {
         ensureCurrent();
         CUdeviceptr ptr = 0;

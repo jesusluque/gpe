@@ -521,6 +521,8 @@ void PooledDevice::memory(size_t& total, size_t& available) const {
     native_->memory(total, available);
 }
 
+void PooledDevice::bindThread() const { native_->bindThread(); }
+
 BufferId PooledDevice::adopt(uint64_t devicePtr, size_t bytes) {
     const std::lock_guard<std::recursive_mutex> held(guard_);
     const BufferId native = native_->adopt(devicePtr, bytes);
