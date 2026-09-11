@@ -9,6 +9,7 @@
 // the presenter has long since uploaded it.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -21,6 +22,40 @@ class DisplayPass {
 public:
     explicit DisplayPass(PooledDevice& device) : device_(&device) {}
     ~DisplayPass();
+
+    /// How a finished picture gets back to the presenter.
+    ///
+    /// `Wait`: the frame just dispatched, downloaded synchronously. Its cost is
+    /// a wait on the device inside every presented frame -- the one thing the
+    /// pool's rules forbid inside a frame.
+    ///
+    /// `Late`: the newest frame whose picture is already back, and never a
+    /// wait on the normal path; a frame of latency. What OpenRV does for SDI
+    /// output with a ring of PBOs, read one frame behind. On a unified-memory
+    /// device there is no readback at all: the pass writes a buffer the CPU
+    /// can already read, and the presenter reads it once the pool has seen
+    /// that work retire. On a discrete card it is `downloadAsync`, which on a
+    /// backend without an asynchronous one (CUDA today) is the same wait as
+    /// `Wait`, a frame later.
+    enum class Readback { Wait, Late };
+
+    /// Before `prepare`, which allocates for the mode. `useShared` false reads
+    /// back with downloadAsync even where memory is unified: the discrete
+    /// card's path, on a machine that would otherwise never take it.
+    void setReadback(Readback mode, bool useShared = true) noexcept {
+        mode_ = mode;
+        useShared_ = useShared;
+    }
+    [[nodiscard]] Readback readback() const noexcept { return mode_; }
+
+    /// `Late` only: hands the presenter the newest picture that has arrived,
+    /// without dispatching anything. For a viewer that stops presenting -- a
+    /// pause -- and still wants the last frame it asked for on screen.
+    void drain(Presenter& presenter);
+
+    /// `Late` only: pictures that arrived but were never shown, because a
+    /// newer one arrived before the presenter was next handed one.
+    [[nodiscard]] uint64_t overtaken() const noexcept { return overtaken_; }
 
     DisplayPass(const DisplayPass&) = delete;
     DisplayPass& operator=(const DisplayPass&) = delete;
@@ -46,14 +81,31 @@ public:
     /// The baking is the host's job, not this class's: OCIO belongs to whoever
     /// owns the config, and an engine that linked it would be an engine with an
     /// opinion about colour management.
-    [[nodiscard]] bool setLut(const float* rgba, int size, float min, float max);
+    /// How the lattice spans its range. See lutInput.
+    enum class LutDomain { Linear, Log2 };
+
+    [[nodiscard]] bool setLut(const float* rgba, int size, float min, float max,
+                              LutDomain domain = LutDomain::Linear);
+
+    /// The linear colour at every lattice point, red fastest, three floats
+    /// each: what the host runs its display transform over to bake the
+    /// lattice for `setLut` with the same size, range and domain. The one
+    /// place the shaper is written on the host side, so the host and the
+    /// kernel cannot disagree about where a lattice point is.
+    ///
+    /// `Log2` for scene-linear pictures: a 33-cube over linear 0..16 has cells
+    /// half a unit wide, so everything below 0.5 -- the shadows and the
+    /// mid-tones -- interpolates across one cell. Spread in stops between,
+    /// say, 2^-10 and 16, every cell is under a stop wide. Values at or below
+    /// `min` show as `min`: choose it below anything a display can show.
+    static void lutInput(int size, float min, float max, LutDomain domain, std::vector<float>& rgb);
 
     /// Transforms, downsamples and packs `source` into the presenter's size,
     /// downloads it, and hands it over.
     ///
-    /// The download is synchronous, and that is the cost this phase pays: about
-    /// 8 MB at a 4K widget rather than the 33 MB a full-size readback would be.
-    /// The interop version behind the same Presenter removes it entirely.
+    /// With `Readback::Wait` the download is synchronous, and that is the cost
+    /// this phase pays: about 8 MB at a 4K widget rather than the 33 MB a
+    /// full-size readback would be. `Readback::Late` removes the wait.
     void present(const Image& source, Presenter& presenter,
                  const DisplayControls& controls, uint64_t frame,
                  const DisplayView& view = {});
@@ -74,17 +126,41 @@ public:
     [[nodiscard]] size_t lastBytes() const noexcept { return lastBytes_; }
 
 private:
+    enum State : int { kIdle = 0, kPending = 1, kReady = 2, kFailed = 3 };
+
     struct Target {
         BufferId buffer = kInvalidBuffer;
+        // Late readback only.
+        unsigned char*             shared = nullptr;   ///< host view of `buffer` (unified memory)
+        std::vector<unsigned char> host;               ///< where downloadAsync lands otherwise
+        std::atomic<int>           state{kIdle};
+        uint64_t                   at = 0;             ///< the dispatch's submission (shared)
+        uint64_t                   order = 0;
+        uint64_t                   frame = 0;
+        int                        width = 0;
+        int                        height = 0;
     };
 
-    /// Two, and the reason is in the file header.
-    static constexpr int kBuffers = 2;
+    /// Two for `Wait`, and the reason is in the file header. Three for `Late`:
+    /// one being written, one travelling back, one on screen.
+    static constexpr int kBuffers = 3;
+
+    void releaseTargets();
+    [[nodiscard]] int usableTargets() const noexcept { return mode_ == Readback::Late ? 3 : 2; }
+    [[nodiscard]] int idleTarget();
+    void dispatchInto(Target& target, const Image& source, const Image& right,
+                      const DisplayControls& controls, int width, int height,
+                      const DisplayView& view);
 
     PooledDevice*              device_ = nullptr;
     KernelId                   kernel_ = kInvalidKernel;
+    Readback                   mode_ = Readback::Wait;
+    bool                       useShared_ = true;
     Target                     targets_[kBuffers];
     int                        at_ = 0;
+    uint64_t                   ordered_ = 0;
+    uint64_t                   shownOrder_ = 0;
+    uint64_t                   overtaken_ = 0;
     int                        maxWidth_ = 0;
     int                        maxHeight_ = 0;
     std::vector<unsigned char> host_;
@@ -92,6 +168,7 @@ private:
     int                        lutSize_ = 0;
     float                      lutMin_ = 0.0f;
     float                      lutMax_ = 1.0f;
+    LutDomain                  lutDomain_ = LutDomain::Linear;
     uint64_t                   presented_ = 0;
     size_t                     lastBytes_ = 0;
 };

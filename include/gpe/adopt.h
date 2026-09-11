@@ -35,4 +35,29 @@ namespace gpe {
 /// interface is that a client names no backend.
 [[nodiscard]] std::unique_ptr<Device> adoptMetalDevice(void* mtlDevice);
 
+/// The same, and also submits on `mtlCommandQueue` instead of a queue of its
+/// own.
+///
+/// One queue is what makes ordering free between gpe and the renderer that
+/// owns the device: Metal runs command buffers on a queue in the order they
+/// were committed, so a buffer a renderer committed before gpe's dispatch is
+/// finished before the dispatch reads it, with no event to encode and no wait.
+/// Transfers still go on gpe's own blit queue, ordered by gpe's own events.
+///
+/// The other direction needs one call. gpe batches its dispatches into one
+/// command buffer and commits it only when something of its own must follow
+/// (see `Device::flush`), so the renderer calls `flush()` before committing
+/// work that reads what gpe's kernels wrote -- or its command buffer lands
+/// first and reads the previous contents.
+[[nodiscard]] std::unique_ptr<Device> adoptMetalDevice(void* mtlDevice,
+                                                       void* mtlCommandQueue);
+
+/// Drives an existing CUDA context -- `CUcontext` -- and, when given, launches
+/// kernels on `cuStream` rather than a stream of its own.
+///
+/// The CUDA half of the same arrangement: a renderer (slang-rhi's CUDA device)
+/// made the context, and gpe's allocations, kernels and the renderer's all
+/// live in it. Null on a build without the CUDA backend.
+[[nodiscard]] std::unique_ptr<Device> adoptCudaContext(void* cuContext, void* cuStream);
+
 }   // namespace gpe

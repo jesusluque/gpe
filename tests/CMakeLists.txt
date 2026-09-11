@@ -34,6 +34,11 @@ if(NOT GPE_BACKEND STREQUAL "none")
     target_include_directories(test_kernels PRIVATE "${GPE_KERNEL_DIR}")
 endif()
 
+if(NOT GPE_BACKEND STREQUAL "none")
+    gpe_test(test_kernel_info)
+    add_dependencies(test_kernel_info gpe_kernels)
+endif()
+
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_pool.cpp")
     gpe_test(test_pool)
 endif()
@@ -67,4 +72,9 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench_shared.cpp" AND
     add_executable(bench_shared bench_shared.cpp)
     target_link_libraries(bench_shared PRIVATE gpe)
     target_include_directories(bench_shared PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+endif()
+
+if(NOT GPE_BACKEND STREQUAL "none")
+    gpe_test(test_dispatch_order)
+    add_dependencies(test_dispatch_order gpe_kernels)
 endif()

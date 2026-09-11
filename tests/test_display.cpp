@@ -6,6 +6,8 @@
 // And that the transfer function is the piecewise sRGB curve rather than a 2.2
 // approximation, because the difference lives in the shadows, which is where a
 // viewer gets looked at hardest.
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -445,6 +447,205 @@ int main() {
     }
 
     device.release(source);
+    // --- a log2 shaper keeps the shadows of a wide scene-linear range ----------
+    {
+        const BufferId shaped = device.alloc(srcBytes);
+        // A lattice baked from lutInput with the sRGB curve standing in for
+        // the host's display transform. Over linear 0..16 on 33 points the
+        // first cell is half a unit wide and a shadow value is a blend of
+        // black and 0.5's code value; spread in stops from 2^-10 to 16 it
+        // lands within a code value of the curve.
+        constexpr int kN = 33;
+        const auto bake = [](int size, float min, float max, DisplayPass::LutDomain domain) {
+            std::vector<float> in;
+            DisplayPass::lutInput(size, min, max, domain, in);
+            std::vector<float> lattice(in.size() / 3 * 4);
+            for (size_t k = 0; k < in.size() / 3; ++k) {
+                for (int c = 0; c < 3; ++c) {
+                    lattice[k * 4 + static_cast<size_t>(c)] = static_cast<float>(srgb(std::max(in[k * 3 + static_cast<size_t>(c)], 0.0f)));
+                }
+                lattice[k * 4 + 3] = 1.0f;
+            }
+            return lattice;
+        };
+        const float shadow = 0.01f;
+        std::vector<float> plate(size_t{kSrcW} * kSrcH * 4, shadow);
+        for (size_t i = 3; i < plate.size(); i += 4) {
+            plate[i] = 1.0f;
+        }
+        device.upload(shaped, plate.data(), srcBytes);
+        const int wanted = static_cast<int>(std::lround(srgb(shadow) * 255.0));
+        const auto through = [&](DisplayPass::LutDomain domain, float min) {
+            const std::vector<float> lattice = bake(kN, min, 16.0f, domain);
+            check(pass.setLut(lattice.data(), kN, min, 16.0f, domain), "the shaped lattice uploads");
+            Capture capture(kSrcW, kSrcH);
+            pass.present(Image{shaped, kSrcW, kSrcH, kSrcW}, capture, DisplayControls{}, 14);
+            return static_cast<int>(capture.at(2, 2, 0));
+        };
+        const int even = through(DisplayPass::LutDomain::Linear, 0.0f);
+        const int stops = through(DisplayPass::LutDomain::Log2, 1.0f / 1024.0f);
+        std::printf("test_display: linear 0.01 through a 33-cube over 0..16: curve %d, even %d, log2 %d\n",
+                    wanted, even, stops);
+        check(std::abs(stops - wanted) <= 1, "a log2-shaped lattice holds a shadow within a code value");
+        check(std::abs(even - wanted) > 4, "where an even lattice over the same range does not");
+        check(pass.setLut(nullptr, 0, 0.0f, 1.0f), "and the lattice comes off again");
+        device.release(shaped);
+    }
+
+    // --- dither: the mean survives rounding, the noise stays within a code ----
+    {
+        const BufferId shaped = device.alloc(srcBytes);
+        // A flat value 0.4 of a code value above 100 after the sRGB curve.
+        const double target = (100.4 / 255.0 + 0.055) / 1.055;
+        const float linear = static_cast<float>(std::pow(target, 2.4));
+        std::vector<float> plate(size_t{kSrcW} * kSrcH * 4, linear);
+        for (size_t i = 3; i < plate.size(); i += 4) {
+            plate[i] = 1.0f;
+        }
+        device.upload(shaped, plate.data(), srcBytes);
+        const auto stats = [&](bool dither, double& mean, int& lo, int& hi) {
+            DisplayControls controls;
+            controls.dither = dither;
+            Capture capture(kSrcW, kSrcH);
+            pass.present(Image{shaped, kSrcW, kSrcH, kSrcW}, capture, controls, 15);
+            double sum = 0.0;
+            lo = 255;
+            hi = 0;
+            for (int y = 0; y < kSrcH; ++y) {
+                for (int x = 0; x < kSrcW; ++x) {
+                    const int v = capture.at(x, y, 0);
+                    sum += v;
+                    lo = std::min(lo, v);
+                    hi = std::max(hi, v);
+                }
+            }
+            mean = sum / (kSrcW * kSrcH);
+        };
+        double plainMean = 0.0, ditheredMean = 0.0;
+        int plainLo = 0, plainHi = 0, lo = 0, hi = 0;
+        stats(false, plainMean, plainLo, plainHi);
+        stats(true, ditheredMean, lo, hi);
+        std::printf("test_display: 100.4 rounds to %.2f plain, %.2f dithered (%d..%d)\n", plainMean,
+                    ditheredMean, lo, hi);
+        check(plainLo == 100 && plainHi == 100, "without dither a flat value rounds to one code");
+        check(std::abs(ditheredMean - 100.4) < 0.1, "with it the mean of the area is the value");
+        check(lo >= 99 && hi <= 102, "and no pixel moves more than a code value and a half");
+        device.release(shaped);
+    }
+
+    // --- late readback: never waits, a frame behind, same pixels -------------
+    {
+        // A flat grey plate and a flat white one on alternate frames, so a
+        // picture handed over under the wrong frame number is visible.
+        std::vector<float> grey(size_t{kSrcW} * kSrcH * 4, 0.18f);
+        std::vector<float> white(size_t{kSrcW} * kSrcH * 4, 1.0f);
+        for (size_t i = 3; i < grey.size(); i += 4) {
+            grey[i] = 1.0f;
+        }
+        const BufferId greySource = device.alloc(srcBytes);
+        const BufferId whiteSource = device.alloc(srcBytes);
+        device.upload(greySource, grey.data(), srcBytes);
+        device.upload(whiteSource, white.data(), srcBytes);
+
+        DisplayControls flat;
+        flat.checkerboard = false;
+        Capture reference(kSrcW, kSrcH);
+        pass.present(Image{greySource, kSrcW, kSrcH, kSrcW}, reference, flat, 0);
+        const unsigned char greyCode = reference.at(3, 3, 0);
+
+        for (const bool shared : {true, false}) {
+        DisplayPass late(device);
+        late.setReadback(DisplayPass::Readback::Late, shared);
+        check(late.prepare(kSrcW, kSrcH), "a late-readback pass prepares");
+
+        /// Checks, as each picture arrives, that frames only go forward and
+        /// that each carries its own plate.
+        class Ordered final : public Presenter {
+        public:
+            explicit Ordered(unsigned char grey) : grey_(grey) {}
+            void targetSize(int& width, int& height) const override {
+                width = kSrcW;
+                height = kSrcH;
+            }
+            void present(const void* rgba8, int, int, uint64_t frame) override {
+                const auto* bytes = static_cast<const unsigned char*>(rgba8);
+                const unsigned char code = bytes[(3 * kSrcW + 3) * 4];
+                forward = forward && (count == 0 || frame > last);
+                matches = matches && code == ((frame % 2) == 0 ? grey_ : 255);
+                last = frame;
+                ++count;
+            }
+            unsigned char grey_;
+            uint64_t      last = 0;
+            int           count = 0;
+            bool          forward = true;
+            bool          matches = true;
+        } ordered(greyCode);
+
+        constexpr int kFrames = 40;
+        for (int f = 0; f < kFrames; ++f) {
+            const BufferId plate = (f % 2) == 0 ? greySource : whiteSource;
+            late.present(Image{plate, kSrcW, kSrcH, kSrcW}, ordered, flat, static_cast<uint64_t>(f));
+        }
+        device.sync();
+        late.drain(ordered);
+
+        check(ordered.forward, "late readback hands frames over in order");
+        check(ordered.matches, "each picture arrives under its own frame number");
+        check(ordered.last == kFrames - 1, "and after a drain the last frame asked for is the one shown");
+        check(ordered.count + static_cast<int>(late.overtaken()) <= kFrames,
+              "no picture is shown twice");
+        std::printf("test_display: late readback (%s) showed %d of %d frames, %llu overtaken\n",
+                    shared ? "shared memory" : "downloadAsync", ordered.count, kFrames,
+                    static_cast<unsigned long long>(late.overtaken()));
+        }
+
+        device.release(greySource);
+        device.release(whiteSource);
+    }
+
+    // --- what each readback costs the thread that presents, at 1080p ---------
+    {
+        constexpr int kW = 1920;
+        constexpr int kH = 1080;
+        const size_t bytes = size_t{kW} * kH * 16;
+        const BufferId plate = device.alloc(bytes);
+        std::vector<float> pixels(size_t{kW} * kH * 4, 0.5f);
+        device.upload(plate, pixels.data(), bytes);
+        class Sink final : public Presenter {
+        public:
+            void targetSize(int& width, int& height) const override {
+                width = kW;
+                height = kH;
+            }
+            void present(const void*, int, int, uint64_t) override {}
+        } sink;
+        const auto timed = [&](DisplayPass::Readback mode, bool shared) {
+            DisplayPass timedPass(device);
+            timedPass.setReadback(mode, shared);
+            if (!timedPass.prepare(kW, kH)) {
+                return -1.0;
+            }
+            for (int f = 0; f < 5; ++f) {   // warm: kernel load, first allocations
+                timedPass.present(Image{plate, kW, kH, kW}, sink, DisplayControls{}, 0);
+            }
+            device.sync();
+            constexpr int kFrames = 60;
+            const auto start = std::chrono::steady_clock::now();
+            for (int f = 0; f < kFrames; ++f) {
+                timedPass.present(Image{plate, kW, kH, kW}, sink, DisplayControls{}, static_cast<uint64_t>(f));
+            }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            device.sync();
+            return ms / kFrames;
+        };
+        std::printf("test_display: 1080p present on the calling thread: wait %.2f ms, late %.2f ms "
+                    "(shared memory), late %.2f ms (downloadAsync)\n",
+                    timed(DisplayPass::Readback::Wait, true), timed(DisplayPass::Readback::Late, true),
+                    timed(DisplayPass::Readback::Late, false));
+        device.release(plate);
+    }
+
     device.sync();
 
     if (failures == 0) {

@@ -27,6 +27,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <optional>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -34,6 +35,7 @@
 
 #include "completion.h"
 #include "hostring.h"
+#include "gpe/adopt.h"
 #include "gpe/args.h"
 #include "gpe/device.h"
 #include "kernel_registry.h"
@@ -103,28 +105,49 @@ public:
             for (const CUmodule module : modules_) {
                 cuModuleUnload(module);
             }
-            cuDevicePrimaryCtxRelease(device_);
+            if (!adoptedContext_) {
+                cuDevicePrimaryCtxRelease(device_);
+            }
         }
     }
 
-    [[nodiscard]] bool open() {
+    /// `context`/`stream` non-null adopts them: a renderer on the same card
+    /// (slang-rhi's CUDA device) made the context, and gpe's allocations and
+    /// kernels live in it rather than in a second one. Neither is released
+    /// here; they belong to whoever made them.
+    [[nodiscard]] bool open(CUcontext context = nullptr, CUstream stream = nullptr) {
         if (!ok(cuInit(0), "cuInit")) {
             return false;
         }
-        int count = 0;
-        if (!ok(cuDeviceGetCount(&count), "cuDeviceGetCount") || count == 0) {
-            return false;
-        }
-        if (!ok(cuDeviceGet(&device_, 0), "cuDeviceGet") ||
-            !ok(cuDevicePrimaryCtxRetain(&context_, device_), "ctxRetain") ||
-            !ok(cuCtxSetCurrent(context_), "ctxSetCurrent")) {
-            return false;
+        if (context != nullptr) {
+            context_ = context;
+            adoptedContext_ = true;
+            if (!ok(cuCtxSetCurrent(context_), "ctxSetCurrent(adopted)") ||
+                !ok(cuCtxGetDevice(&device_), "ctxGetDevice(adopted)")) {
+                return false;
+            }
+        } else {
+            int count = 0;
+            if (!ok(cuDeviceGetCount(&count), "cuDeviceGetCount") || count == 0) {
+                return false;
+            }
+            if (!ok(cuDeviceGet(&device_, 0), "cuDeviceGet") ||
+                !ok(cuDevicePrimaryCtxRetain(&context_, device_), "ctxRetain") ||
+                !ok(cuCtxSetCurrent(context_), "ctxSetCurrent")) {
+                return false;
+            }
         }
         // A stream of our own, not the default one. The default stream
         // synchronises against every other stream in the process, which would
         // make "asynchronous by default" a promise the first library we link
         // against could break.
-        if (!ok(cuStreamCreate(&stream_, CU_STREAM_NON_BLOCKING), "streamCreate")) {
+        //
+        // Unless one is handed over: the renderer's stream, so that its work
+        // and gpe's are ordered by the stream itself, exactly as openFXplayer
+        // orders TensorRT behind gpe's kernels.
+        if (stream != nullptr) {
+            stream_ = stream;
+        } else if (!ok(cuStreamCreate(&stream_, CU_STREAM_NON_BLOCKING), "streamCreate")) {
             return false;
         }
         // A second stream for transfers.
@@ -362,6 +385,14 @@ public:
         return reinterpret_cast<uint64_t>(stream_);
     }
 
+    [[nodiscard]] uint64_t backendBuffer(BufferId id) const override {
+        return devicePointer(id);
+    }
+    [[nodiscard]] uint64_t backendDevice() const override {
+        return reinterpret_cast<uint64_t>(context_);
+    }
+    [[nodiscard]] uint64_t backendQueue() const override { return stream(); }
+
     void memory(size_t& total, size_t& available) const override {
         ensureCurrent();
         size_t free = 0;
@@ -417,13 +448,16 @@ public:
             }
         }
         // Through the registry, so a kernel a plugin brought with it is
-// found the same way one compiled into this library is.
-        const kernels::Blob* blob = kernels::lookup(name);
-        if (blob == nullptr) {
+        // found the same way one compiled into this library is -- and with its
+        // trailer, if it has one, already taken off: PTX is text and a
+        // trailer after it is a module the driver refuses.
+        const kernels::Resolved* resolved = kernels::resolve(name);
+        if (resolved == nullptr) {
             std::fprintf(stderr, "gpe/cuda: no kernel '%.*s' in this binary\n",
                          static_cast<int>(name.size()), name.data());
             return kInvalidKernel;
         }
+        const kernels::Blob* blob = &resolved->blob;
         CUmodule module = nullptr;
         // The PTX is text and the blob is not terminated, so it is copied into
         // a string first. Once per kernel, ever.
@@ -449,7 +483,7 @@ public:
         }
         modules_.push_back(module);
         kernels_.push_back(Kernel{std::string(name), function, globals,
-                                  globalsBytes});
+                                  globalsBytes, resolved->info});
         return static_cast<KernelId>(kernels_.size());
     }
 
@@ -464,6 +498,25 @@ public:
         if (!view.valid) {
             std::fprintf(stderr, "gpe/cuda: malformed dispatch args\n");
             return;
+        }
+        // What the kernel's reflection says, when its blob carried it. A
+        // dispatch that does not match is refused here rather than run over
+        // the wrong buffers -- openFXplayer's D30, made an error.
+        if (kernel.info.has_value()) {
+            if (kernel.info->elementBytes.size() != view.bufferCount) {
+                std::fprintf(stderr,
+                             "gpe/cuda: %s declares %zu buffers and was handed %u\n",
+                             kernel.name.c_str(), kernel.info->elementBytes.size(),
+                             view.bufferCount);
+                return;
+            }
+            if (kernel.info->uniformBytes != view.uniformBytes) {
+                std::fprintf(stderr,
+                             "gpe/cuda: %s declares %u bytes of uniforms and was handed %u\n",
+                             kernel.name.c_str(), kernel.info->uniformBytes,
+                             view.uniformBytes);
+                return;
+            }
         }
 
         // The uniforms go to device memory first, because the generated struct
@@ -511,10 +564,17 @@ public:
                 // caller because the host cannot infer it. Slang bound-checks
                 // against this number: too small and it drops writes without
                 // saying so.
-                const uint32_t stride = view.elementBytes != nullptr &&
-                                                view.elementBytes[i] > 0
-                                            ? view.elementBytes[i]
-                                            : static_cast<uint32_t>(kBytesPerPixel);
+                //
+                // The kernel's own answer wins over the caller's. A host
+                // relaying a plugin's buffers cannot know T and passed one byte
+                // to keep this check from truncating; reflection knows T.
+                uint32_t stride = view.elementBytes != nullptr &&
+                                          view.elementBytes[i] > 0
+                                      ? view.elementBytes[i]
+                                      : static_cast<uint32_t>(kBytesPerPixel);
+                if (kernel.info.has_value() && kernel.info->elementBytes[i] > 0) {
+                    stride = kernel.info->elementBytes[i];
+                }
                 entry.data = a->ptr;
                 entry.count = a->bytes / stride;
             }
@@ -576,8 +636,16 @@ public:
         // declare 64x1 or 1x1 and cooperate through nothing but atomics, so
         // a flat block is both correct and fully occupied.
         const bool     flat = grid.y == 1 && grid.z == 1;
-        const uint32_t blockX = flat ? kGroupX * kGroupY : kGroupX;
-        const uint32_t blockY = flat ? 1 : kGroupY;
+        uint32_t       blockX = flat ? kGroupX * kGroupY : kGroupX;
+        uint32_t       blockY = flat ? 1 : kGroupY;
+        uint32_t       blockZ = 1;
+        // A kernel that says what its group is gets exactly that, as it would
+        // on D3D or Vulkan -- the guess above is for blobs that do not say.
+        if (kernel.info.has_value()) {
+            blockX = kernel.info->threadGroup[0];
+            blockY = kernel.info->threadGroup[1];
+            blockZ = kernel.info->threadGroup[2];
+        }
         // Compute waits for whatever was uploaded since the last dispatch, and
         // for nothing else. Without this the kernel could read a buffer whose
         // DMA is still running; with a full synchronisation instead, there
@@ -592,8 +660,8 @@ public:
         // No kernel parameters at all: Slang puts everything in the
         // __constant__ block, so the launch passes nothing.
         (void)ok(cuLaunchKernel(kernel.function, groups(grid.x, blockX),
-                                groups(grid.y, blockY), groups(grid.z, 1),
-                                blockX, blockY, 1, 0, stream_, nullptr,
+                                groups(grid.y, blockY), groups(grid.z, blockZ),
+                                blockX, blockY, blockZ, 0, stream_, nullptr,
                                 nullptr),
                  "cuLaunchKernel");
         noteCompute();
@@ -705,6 +773,8 @@ private:
         CUfunction  function = nullptr;
         CUdeviceptr globals = 0;
         size_t      globalsBytes = 0;
+        /// The blob's trailer, if it had one. See gpe/kernels.h.
+        std::optional<KernelInfo> info;
     };
 
     /// Matches [numthreads(16, 16, 1)] in the kernels. One place, and
@@ -809,6 +879,8 @@ private:
 
     CUdevice    device_ = 0;
     CUcontext   context_ = nullptr;
+    /// Made by somebody else; not released here.
+    bool        adoptedContext_ = false;
     CUstream    stream_ = nullptr;
     CUdeviceptr staging_[kStagingSlots]{};
     void*       pinned_[kStagingSlots]{};
@@ -847,5 +919,20 @@ std::unique_ptr<Device> Device::create() {
     }
     return device;
 }
+
+std::unique_ptr<Device> adoptCudaContext(void* cuContext, void* cuStream) {
+    if (cuContext == nullptr) {
+        return nullptr;
+    }
+    auto device = std::make_unique<CudaDevice>();
+    if (!device->open(static_cast<CUcontext>(cuContext), static_cast<CUstream>(cuStream))) {
+        return nullptr;
+    }
+    return device;
+}
+
+// No Metal on this backend. Defined so a client that asks links and is told.
+std::unique_ptr<Device> adoptMetalDevice(void*) { return nullptr; }
+std::unique_ptr<Device> adoptMetalDevice(void*, void*) { return nullptr; }
 
 }   // namespace gpe

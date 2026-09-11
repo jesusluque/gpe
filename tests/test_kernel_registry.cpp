@@ -70,9 +70,10 @@ int main() {
           "and replaces what was there");
 
     // A plugin must not be able to shadow a kernel gpe ships with. The build's
-    // table is consulted first, so naming a kernel `scale` gets you nowhere.
-    check(registerKernel("scale", "notScaleMain", kOther, sizeof(kOther)),
-          "a name that collides with a built-in one registers");
+    // table is consulted first, so naming a kernel `scale` gets you nowhere --
+    // and is now refused outright, rather than accepted and never found.
+    check(!registerKernel("scale", "notScaleMain", kOther, sizeof(kOther)),
+          "a name that collides with a built-in one is refused");
     const kernels::Blob* scale = kernels::lookup("scale");
     check(scale != nullptr && scale->data != kOther,
           "but does not shadow the kernel this library compiled in");

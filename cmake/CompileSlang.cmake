@@ -53,6 +53,8 @@ elseif(GPE_BACKEND STREQUAL "CUDA")
 endif()
 
 set(GPE_KERNEL_DIR "${GPE_BUILD}/kernels")
+# For hosts whose own kernel embedding wants the same trailer (aofx_add_kernel).
+set(GPE_KERNEL_TRAILER_SCRIPT "${GPE_ROOT}/cmake/KernelTrailer.cmake")
 file(MAKE_DIRECTORY "${GPE_KERNEL_DIR}")
 
 # Visible to whoever added this project, so a plugin built alongside it can
@@ -68,6 +70,7 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(GPE_METALLIB  "${GPE_METALLIB}"  PARENT_SCOPE)
     set(GPE_NVCC      "${GPE_NVCC}"      PARENT_SCOPE)
     set(GPE_CUDA_ARCH "${GPE_CUDA_ARCH}" PARENT_SCOPE)
+    set(GPE_KERNEL_TRAILER_SCRIPT "${GPE_KERNEL_TRAILER_SCRIPT}" PARENT_SCOPE)
 endif()
 
 # gpe_compile_slang(<name> ENTRY <entry>)
@@ -83,6 +86,9 @@ function(gpe_compile_slang name)
 
     set(source "${GPE_ROOT}/kernels/${name}.slang")
     set(blob "${GPE_KERNEL_DIR}/${name}.blob")
+    # What slangc knows about the kernel, for the trailer the header embeds.
+    # See cmake/KernelTrailer.cmake.
+    set(json "${GPE_KERNEL_DIR}/${name}.reflection.json")
 
     # Every kernel imports common.slang, so a change to it has to rebuild all of
     # them. Listed as a dependency rather than globbed: a glob is re-run at
@@ -97,6 +103,7 @@ function(gpe_compile_slang name)
             OUTPUT "${blob}"
             COMMAND ${GPE_SLANGC} "${source}" -target metal
                     -entry ${ARG_ENTRY} -stage compute -o "${msl}"
+                    -reflection-json "${json}"
             COMMAND ${GPE_METAL} -c "${msl}" -o "${air}"
             COMMAND ${GPE_METALLIB} "${air}" -o "${blob}"
             DEPENDS ${deps}
@@ -112,6 +119,7 @@ function(gpe_compile_slang name)
             OUTPUT "${blob}"
             COMMAND ${GPE_SLANGC} "${source}" -target cuda
                     -entry ${ARG_ENTRY} -stage compute -o "${cu}"
+                    -reflection-json "${json}"
             COMMAND ${GPE_NVCC} -ptx "${cu}" -o "${blob}"
                     -arch=${GPE_CUDA_ARCH}
             DEPENDS ${deps}
@@ -125,6 +133,7 @@ function(gpe_compile_slang name)
     set_property(GLOBAL APPEND PROPERTY GPE_KERNEL_NAMES "${name}")
     set_property(GLOBAL APPEND PROPERTY GPE_KERNEL_ENTRIES "${ARG_ENTRY}")
     set_property(GLOBAL APPEND PROPERTY GPE_KERNEL_BLOBS "${blob}")
+    set_property(GLOBAL APPEND PROPERTY GPE_KERNEL_JSONS "${json}")
 endfunction()
 
 # gpe_write_kernel_header(<target>)
@@ -135,6 +144,7 @@ function(gpe_write_kernel_header target)
     get_property(names GLOBAL PROPERTY GPE_KERNEL_NAMES)
     get_property(entries GLOBAL PROPERTY GPE_KERNEL_ENTRIES)
     get_property(blobs GLOBAL PROPERTY GPE_KERNEL_BLOBS)
+    get_property(jsons GLOBAL PROPERTY GPE_KERNEL_JSONS)
     if(NOT names)
         message(FATAL_ERROR "gpe_write_kernel_header: no kernels compiled")
     endif()
@@ -150,7 +160,9 @@ function(gpe_write_kernel_header target)
 set(names \"${names}\")
 set(entries \"${entries}\")
 set(blobs \"${blobs}\")
+set(jsons \"${jsons}\")
 set(out \"${header}\")
+include(\"${GPE_ROOT}/cmake/KernelTrailer.cmake\")
 
 set(body \"// Generated at build time from kernels/*.slang. Do not edit.\\n\")
 string(APPEND body \"#pragma once\\n\\n#include <cstddef>\\n#include <string_view>\\n\\n\")
@@ -161,7 +173,11 @@ math(EXPR last \"\${count} - 1\")
 foreach(i RANGE \${last})
     list(GET names \${i} name)
     list(GET blobs \${i} blob)
+    list(GET jsons \${i} json)
+    list(GET entries \${i} entry)
     file(READ \"\${blob}\" hex HEX)
+    gpe_kernel_trailer_hex(\"\${json}\" \"\${entry}\" trailer)
+    string(APPEND hex \"\${trailer}\")
     string(REGEX REPLACE \"(..)\" \"0x\\\\1,\" bytes \"\${hex}\")
     string(REGEX REPLACE \"(0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,)\" \"\\\\1\\n    \" bytes \"\${bytes}\")
     string(APPEND body \"inline constexpr unsigned char k_\${name}[] = {\\n    \${bytes}\\n};\\n\\n\")
@@ -190,7 +206,7 @@ file(WRITE \"\${out}\" \"\${body}\")
     add_custom_command(
         OUTPUT "${header}"
         COMMAND ${CMAKE_COMMAND} -P "${script}"
-        DEPENDS ${blobs} "${script}"
+        DEPENDS ${blobs} "${script}" "${GPE_ROOT}/cmake/KernelTrailer.cmake"
         COMMENT "embedding ${names}"
         VERBATIM)
 

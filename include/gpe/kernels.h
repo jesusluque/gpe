@@ -15,8 +15,12 @@
 // find the same kernels, which is what anybody would expect.
 #pragma once
 
+#include <array>
 #include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <string_view>
+#include <vector>
 
 namespace gpe {
 
@@ -34,10 +38,50 @@ namespace gpe {
 /// during development does what a person expects rather than keeping the first
 /// version forever.
 ///
-/// False if the name or the blob is empty. Not thread-safe: this belongs where
-/// plugins are loaded, which is before there is a second thread.
+/// **A name this library compiled in is refused**, with a line on stderr. It
+/// used to be accepted and then never found -- the build's own table is looked
+/// up first -- so a plugin that called a kernel `display` ran gpe's display
+/// pass over its buffers with its uniforms, and said nothing about it.
+///
+/// A blob carrying a gpe kernel trailer (cmake/KernelTrailer.cmake) is
+/// stripped of it here and the trailer becomes the kernel's `KernelInfo`.
+///
+/// False if the name or the blob is empty, or the name is taken by the build.
+/// Not thread-safe: this belongs where plugins are loaded, which is before
+/// there is a second thread.
 bool registerKernel(std::string_view name, std::string_view entry,
                     const void* blob, size_t bytes);
+
+/// What a kernel's own reflection says about it, when its blob carried a
+/// trailer. Empty for a blob compiled without one.
+///
+/// Facts a dispatch depends on and a caller could otherwise only guess:
+///
+///   - `threadGroup`: the kernel's [numthreads]. Both backends launch
+///     ceil(grid / threadGroup) whole groups of exactly this shape, which is
+///     what D3D and Vulkan do and what a kernel using shared group memory needs.
+///   - `elementBytes`: one element of each structured buffer, in declaration
+///     order, for the target the blob was compiled for. CUDA's bounds check
+///     counts in these.
+///   - `uniformBytes`: the ConstantBuffer's size. A dispatch whose uniform
+///     block is a different size is refused rather than run.
+struct KernelInfo {
+    std::array<uint32_t, 3> threadGroup{1, 1, 1};
+    std::vector<uint32_t>   elementBytes;
+    uint32_t                uniformBytes = 0;
+};
+
+[[nodiscard]] std::optional<KernelInfo> kernelInfo(std::string_view name);
+
+/// Splits a blob into its payload and trailer. `payloadBytes` is `bytes` when
+/// there is no trailer. Exposed for the host that wants to check a dispatch
+/// against a kernel before queueing it, and for tests.
+struct ParsedKernelBlob {
+    size_t                    payloadBytes = 0;
+    std::optional<KernelInfo> info;
+};
+[[nodiscard]] ParsedKernelBlob parseKernelBlob(const void* blob, size_t bytes,
+                                               std::string_view entry);
 
 /// Forgets one. For a bundle that failed to load after registering some of its
 /// kernels: leaving a name pointing into memory that is about to be unmapped is

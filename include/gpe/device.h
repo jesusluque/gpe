@@ -6,6 +6,7 @@
 // decides once, at startup, and everything after that is this interface.
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string_view>
 
@@ -76,6 +77,16 @@ public:
     /// Waits for everything queued so far. Once a frame, not once a dispatch.
     virtual void sync() = 0;
 
+    /// Hands everything queued so far to the device, without waiting.
+    ///
+    /// A backend may hold several dispatches back to submit them together
+    /// (Metal does: one command buffer, not one each). Everything this
+    /// interface does that must follow them -- upload, download, fill, sync --
+    /// already flushes. What cannot is another runtime submitting on the same
+    /// queue (`backendQueue`, adopt.h): call this before it reads what gpe
+    /// wrote. A backend that submits each dispatch at once has nothing to do.
+    virtual void flush() {}
+
     /// The backend's own address for a buffer, and the queue it runs on.
     ///
     /// FOR ONE KIND OF CALLER ONLY
@@ -121,6 +132,38 @@ public:
 
     [[nodiscard]] virtual uint64_t devicePointer(BufferId) const { return 0; }
     [[nodiscard]] virtual uint64_t stream() const { return 0; }
+
+    /// The backend's own objects: an `MTL::Buffer*` or a CUDA device pointer
+    /// for a buffer; the `MTL::Device*` or `CUcontext`; the `MTL::CommandQueue*`
+    /// or `CUstream`.
+    ///
+    /// For one caller: a second runtime on the *same* device -- a renderer that
+    /// adopted this device or that this device adopted -- which wraps these in
+    /// its own buffer objects and reads what gpe wrote without a copy.
+    /// `devicePointer` answers the same question for CUDA only, and for Metal
+    /// says zero on purpose; this one answers for both, because a Metal caller
+    /// that has a device of its own does know what to do with an MTLBuffer.
+    ///
+    /// Zero where there is no such object.
+    [[nodiscard]] virtual uint64_t backendBuffer(BufferId) const { return 0; }
+    [[nodiscard]] virtual uint64_t backendDevice() const { return 0; }
+    [[nodiscard]] virtual uint64_t backendQueue() const { return 0; }
+
+    /// Reads back without waiting: `done(true)` runs once `bytes` are in `dst`,
+    /// on whatever thread the driver finishes on, and must only store.
+    ///
+    /// `dst` must stay valid until then. For a renderer that wants last
+    /// frame's counts without stalling this frame for them.
+    ///
+    /// The default is the synchronous `download` followed by `done` -- correct,
+    /// and exactly as slow as before, on a backend that has not been taught.
+    virtual void downloadAsync(BufferId id, void* dst, size_t bytes,
+                               std::function<void(bool)> done) {
+        download(dst, id, bytes);
+        if (done) {
+            done(true);
+        }
+    }
 
     /// How much memory this device has, and how much of it is unspoken for.
     ///

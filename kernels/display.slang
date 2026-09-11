@@ -20,8 +20,11 @@
 // So it is baked: the host runs OCIO over an identity cube once, when the
 // display or the view changes, and hands the result over as a 3D lattice this
 // samples trilinearly. That is what every player that is not itself a shader
-// compiler does, and the accuracy is a property of the grid size rather than of
-// this file -- 33 on a side is the usual answer and 65 is the careful one.
+// compiler does. The accuracy is a property of the grid size -- 33 on a side is
+// the usual answer and 65 is the careful one -- and of how the grid is spread:
+// evenly over a scene-linear range it wastes nearly every cell on highlights,
+// so a log2 shaper spreads it in stops (lutShaper; the host bakes through
+// DisplayPass::lutInput, which writes the same shaper on its side).
 //
 // With no lattice bound the pass falls back to an sRGB encode, which is a
 // defensible picture rather than a black one and is what a machine with no
@@ -73,6 +76,16 @@ struct DisplayParams {
     float viewOriginY;
     float viewPerPixelX;
     float viewPerPixelY;
+    /// How a linear value finds its place in the lattice: 0 spreads
+    /// [lutMin, lutMax] evenly, 1 spreads log2 of it evenly (both ends then
+    /// linear values above zero). Scene-linear 0..16 on an even 33-cube puts
+    /// every value under 0.5 -- all of the shadows and the mid-tones -- in the
+    /// first cell; in stops each cell is under a stop wide wherever it lands.
+    uint  lutShaper;
+    /// Non-zero to add triangular noise of one code value before the picture
+    /// is rounded to 8 bits, so a smooth gradient reads as smooth rather than
+    /// as bands a code value apart.
+    uint  dither;
 };
 
 StructuredBuffer<float4>     src;
@@ -95,6 +108,17 @@ float encodeSrgb(float linear) {
     return v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055;
 }
 
+/// Triangular noise in (-1, 1), fixed per pixel: a still frame does not
+/// shimmer, and the same pixel reads the same in every frame it is paused on.
+float triangularNoise(uint2 xy) {
+    uint h = xy.x * 0x8da6b343u ^ xy.y * 0xd8163841u;
+    h = (h ^ (h >> 15)) * 0x2c1b3c6du;
+    h = (h ^ (h >> 12)) * 0x297a2d39u;
+    const float a = float(h & 0xFFFFu) / 65535.0;
+    const float b = float((h >> 16) & 0xFFFFu) / 65535.0;
+    return a + b - 1.0;
+}
+
 uint packRgba8(float4 colour) {
     // Rounded, not truncated. Truncating loses half a code value everywhere and
     // shows up as a picture that is consistently a shade dark.
@@ -110,8 +134,16 @@ uint packRgba8(float4 colour) {
 /// on a 33-cube shows the cube's own structure in a sky.
 float3 sampleLut(float3 colour) {
     const float size = float(params.lutSize);
-    const float span = max(params.lutMax - params.lutMin, 1e-6);
-    float3 t = clamp((colour - params.lutMin) / span, 0.0, 1.0) * (size - 1.0);
+    float3 unit;
+    if (params.lutShaper == 1u) {
+        const float lo = log2(max(params.lutMin, 1e-10));
+        const float hi = log2(max(params.lutMax, params.lutMin * 2.0));
+        unit = (log2(max(colour, float3(params.lutMin))) - lo) / (hi - lo);
+    } else {
+        const float span = max(params.lutMax - params.lutMin, 1e-6);
+        unit = (colour - params.lutMin) / span;
+    }
+    float3 t = clamp(unit, 0.0, 1.0) * (size - 1.0);
 
     const int3 i0 = int3(floor(t));
     const int3 i1 = min(i0 + int3(1, 1, 1), int3(int(size) - 1, int(size) - 1, int(size) - 1));
@@ -257,6 +289,9 @@ void displayMain(uint3 tid: SV_DispatchThreadID) {
         encoded = lerp(checker, encoded, colour.w);
     }
 
+    if (params.dither != 0u) {
+        encoded = encoded + float3(triangularNoise(xy) / 255.0);
+    }
     dst[pixelIndex(xy, params.dstStride)] =
         packRgba8(float4(encoded.x, encoded.y, encoded.z, colour.w));
 }

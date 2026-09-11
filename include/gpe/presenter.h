@@ -98,6 +98,12 @@ struct DisplayControls {
     /// The divider of an A/B wipe, 0..1 across the output. Only read when the
     /// pass is given a second image.
     float wipeAt = 0.5f;
+
+    /// One code value of triangular noise before the picture is rounded to
+    /// 8 bits, fixed per pixel. Off by default, because it changes every
+    /// output byte a caller may be comparing; on for a viewer, where a sky
+    /// otherwise shows bands a code value apart.
+    bool dither = false;
 };
 
 /// Which part of the source the target shows, and at what scale.

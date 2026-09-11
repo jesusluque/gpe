@@ -5,6 +5,7 @@
 #include "hostring.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cassert>
 #include <cstdio>
@@ -149,6 +150,28 @@ const PooledDevice::Slot* PooledDevice::resolve(BufferId id) const noexcept {
     }
     return &found;
 }
+
+namespace {
+
+/// Says so when a caller hands over a handle that is no longer live.
+///
+/// The generation check turns a use-after-release into nothing happening
+/// rather than a write into somebody else's picture, which is right -- and
+/// nothing happening is silent, so the symptom is a frame of stale or zeroed
+/// pixels a long way from the release that caused it. The first few are
+/// reported, with the call; after that the log is not flooded.
+void complainStale(const char* what, BufferId id) {
+    static std::atomic<int> reported{0};
+    constexpr int kReports = 8;
+    const int n = reported.fetch_add(1, std::memory_order_relaxed);
+    if (n < kReports) {
+        std::fprintf(stderr, "gpe: %s with buffer %llu, which is not live (released, or never allocated)%s\n",
+                     what, static_cast<unsigned long long>(id),
+                     n + 1 == kReports ? "; further reports suppressed" : "");
+    }
+}
+
+}   // namespace
 
 BufferId PooledDevice::nativeHandle(BufferId id) const noexcept {
     const Slot* slot = resolve(id);
@@ -333,6 +356,8 @@ void PooledDevice::upload(BufferId id, const void* src, size_t bytes) {
     const std::lock_guard<std::recursive_mutex> held(guard_);
     if (const Slot* slot = resolve(id); slot != nullptr) {
         native_->upload(slot->native, src, bytes);
+    } else {
+        complainStale("upload", id);
     }
 }
 
@@ -340,13 +365,19 @@ void PooledDevice::download(void* dst, BufferId id, size_t bytes) {
     const std::lock_guard<std::recursive_mutex> held(guard_);
     if (const Slot* slot = resolve(id); slot != nullptr) {
         native_->download(dst, slot->native, bytes);
+    } else {
+        complainStale("download", id);
     }
 }
 
 bool PooledDevice::fill(BufferId id, uint8_t byte, size_t bytes) {
     const std::lock_guard<std::recursive_mutex> held(guard_);
     const Slot* slot = resolve(id);
-    return slot != nullptr && native_->fill(slot->native, byte, bytes);
+    if (slot == nullptr) {
+        complainStale("fill", id);
+        return false;
+    }
+    return native_->fill(slot->native, byte, bytes);
 }
 
 KernelId PooledDevice::load(std::string_view name) { return native_->load(name); }
@@ -389,7 +420,11 @@ void PooledDevice::dispatch(KernelId kernel, Grid grid, const void* args,
         auto* handles = reinterpret_cast<BufferId*>(
             translated_.data() + 2 * sizeof(uint32_t));
         for (uint32_t i = 0; i < view.bufferCount; ++i) {
-            handles[i] = nativeHandle(handles[i]);
+            const BufferId pooled = handles[i];
+            handles[i] = nativeHandle(pooled);
+            if (handles[i] == kInvalidBuffer && pooled != kInvalidBuffer) {
+                complainStale("dispatch", pooled);
+            }
         }
         forward = translated_.data();
         forwardBytes = translated_.size();
@@ -414,11 +449,19 @@ void PooledDevice::sync() {
     reclaimLocked();
 }
 
+void PooledDevice::flush() {
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    native_->flush();
+}
+
 void PooledDevice::waitFor(Submission at) {
     reclaim();
     if (retired(at)) {
         return;
     }
+    // A backend holding the submission back in a batch would never report it:
+    // hand it over first, or every wait is a spin and a full sync.
+    flush();
     // Long enough for work that is nearly done to land, short enough not to
     // burn a core on a backend that will never publish anything.
     for (int spins = 0; spins < 10000; ++spins) {
@@ -516,6 +559,28 @@ uint64_t PooledDevice::devicePointer(BufferId id) const {
 }
 
 uint64_t PooledDevice::stream() const { return native_->stream(); }
+
+uint64_t PooledDevice::backendBuffer(BufferId id) const {
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    const Slot* slot = resolve(id);
+    return slot != nullptr ? native_->backendBuffer(slot->native) : 0;
+}
+
+uint64_t PooledDevice::backendDevice() const { return native_->backendDevice(); }
+uint64_t PooledDevice::backendQueue() const { return native_->backendQueue(); }
+
+void PooledDevice::downloadAsync(BufferId id, void* dst, size_t bytes,
+                                 std::function<void(bool)> done) {
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    const Slot* slot = resolve(id);
+    if (slot == nullptr) {
+        if (done) {
+            done(false);
+        }
+        return;
+    }
+    native_->downloadAsync(slot->native, dst, bytes, std::move(done));
+}
 
 void* PooledDevice::allocHost(size_t bytes) {
     const std::lock_guard<std::recursive_mutex> held(guard_);

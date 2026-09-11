@@ -25,15 +25,25 @@
 // dispatch can be in threads, with no rounding up to whole groups. The kernel
 // still bounds-checks, because the CUDA side does round up and one kernel
 // serves both.
+// metal-cpp's selector tables are defined exactly once per program, by
+// whichever translation unit defines these. gpe is that unit on its own; linked
+// beside another metal-cpp user that already defines them -- slang-rhi, in
+// lucabRTrender -- two definitions are a link error, so the embedding build
+// turns GPE_METAL_CPP_IMPLEMENTATION off and gpe uses the other one's.
+#if !defined(GPE_NO_METAL_CPP_IMPLEMENTATION)
 #define NS_PRIVATE_IMPLEMENTATION
 #define MTL_PRIVATE_IMPLEMENTATION
 #define CA_PRIVATE_IMPLEMENTATION
+#endif
 
 #include <Foundation/Foundation.hpp>
 #include <Metal/Metal.hpp>
 
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -76,6 +86,13 @@ class MetalDevice final : public Device,
                          public HostStaging {
 public:
     ~MetalDevice() override {
+        sync();
+        if (previous_ != nullptr) {
+            previous_->release();
+        }
+        if (lastBlit_ != nullptr) {
+            lastBlit_->release();
+        }
         for (MTL::Buffer* buffer : buffers_) {
             if (buffer != nullptr) {
                 buffer->release();
@@ -99,6 +116,9 @@ public:
         if (readback_ != nullptr) {
             readback_->release();
         }
+        for (MTL::Buffer* spare : spareStaging_) {
+            spare->release();
+        }
         if (uploadEvent_ != nullptr) {
             uploadEvent_->release();
         }
@@ -119,12 +139,14 @@ public:
     /// Takes a device somebody else made, retaining it for as long as this
     /// object lives. The caller keeps its own reference: it is still drawing
     /// with it.
-    [[nodiscard]] bool adopt(MTL::Device* device) {
+    [[nodiscard]] bool adopt(MTL::Device* device, MTL::CommandQueue* queue = nullptr) {
         if (device == nullptr) {
             return false;
         }
         device_ = device->retain();
-        queue_ = device_->newCommandQueue();
+        // The renderer's queue when it offers one: Metal orders command buffers
+        // on a queue by commit, so its work and ours need nothing between them.
+        queue_ = queue != nullptr ? queue->retain() : device_->newCommandQueue();
         blitQueue_ = device_->newCommandQueue();
         uploadEvent_ = device_->newEvent();
         computeEvent_ = device_->newEvent();
@@ -151,6 +173,32 @@ public:
     }
 
     [[nodiscard]] Backend backend() const override { return Backend::Metal; }
+
+    [[nodiscard]] uint64_t backendBuffer(BufferId id) const override {
+        MTL::Buffer* const* slot = const_cast<MetalDevice*>(this)->find(id);
+        return slot != nullptr ? reinterpret_cast<uint64_t>(*slot) : 0;
+    }
+    [[nodiscard]] uint64_t backendDevice() const override {
+        return reinterpret_cast<uint64_t>(device_);
+    }
+    [[nodiscard]] uint64_t backendQueue() const override {
+        return reinterpret_cast<uint64_t>(queue_);
+    }
+
+    /// An `MTL::Buffer*` somebody else made on this device, retained for as
+    /// long as the handle lives. Metal has had the notion all along -- a buffer
+    /// is an object, and taking a reference to one is what a renderer sharing
+    /// this device hands over -- and the backend answered "no" only because
+    /// the first foreign memory it met was a CUDA pointer.
+    [[nodiscard]] BufferId adopt(uint64_t buffer, size_t bytes) override {
+        auto* foreign = reinterpret_cast<MTL::Buffer*>(buffer);
+        if (foreign == nullptr || bytes == 0 || foreign->length() < bytes ||
+            foreign->device() != device_) {
+            return kInvalidBuffer;
+        }
+        buffers_.push_back(foreign->retain());
+        return static_cast<BufferId>(buffers_.size());
+    }
 
     [[nodiscard]] BufferId alloc(size_t bytes) override {
         // Private storage: the GPU's own memory, not visible to the CPU.
@@ -198,6 +246,7 @@ public:
         // Copying them into a second shared buffer first would be 33 MB of
         // memcpy per frame to arrive where they already were.
         if (MTL::Buffer* source = hostBufferFor(src, bytes); source != nullptr) {
+            flushBatch();
             MTL::CommandBuffer* direct = blitQueue_->commandBuffer();
             awaitCompute(direct);
             MTL::BlitCommandEncoder* encoder = direct->blitCommandEncoder();
@@ -231,6 +280,7 @@ public:
         }
         std::memcpy(staging->contents(), src, bytes);
 
+        flushBatch();
         MTL::CommandBuffer* commands = blitQueue_->commandBuffer();
         awaitCompute(commands);
         MTL::BlitCommandEncoder* blit = commands->blitCommandEncoder();
@@ -282,6 +332,7 @@ public:
         if (readback_ == nullptr) {
             return;
         }
+        flushBatch();
         MTL::CommandBuffer* commands = queue_->commandBuffer();
         // Ordered against the transfers, exactly as a dispatch is.
         //
@@ -333,6 +384,7 @@ public:
         if (bytes > (*slot)->length()) {
             return false;
         }
+        flushBatch();
         MTL::CommandBuffer* commands = queue_->commandBuffer();
         MTL::BlitCommandEncoder* blit = commands->blitCommandEncoder();
         blit->fillBuffer(*slot, NS::Range::Make(0, bytes), byte);
@@ -370,8 +422,11 @@ public:
             }
         }
         // Through the registry, so a kernel a plugin brought with it is
-// found the same way one compiled into this library is.
-        const kernels::Blob* blob = kernels::lookup(name);
+        // found the same way one compiled into this library is -- and with any
+        // trailer already taken off: newLibrary refuses bytes after the end
+        // of a metallib.
+        const kernels::Resolved* resolved = kernels::resolve(name);
+        const kernels::Blob* blob = resolved != nullptr ? &resolved->blob : nullptr;
         if (blob == nullptr) {
             std::fprintf(stderr, "gpe/metal: no kernel '%.*s' in this binary\n",
                          static_cast<int>(name.size()), name.data());
@@ -410,7 +465,7 @@ public:
                          describe(error).c_str());
             return kInvalidKernel;
         }
-        kernels_.push_back(Kernel{std::string(name), pipeline});
+        kernels_.push_back(Kernel{std::string(name), pipeline, resolved->info});
         return static_cast<KernelId>(kernels_.size());
     }
 
@@ -425,18 +480,37 @@ public:
             std::fprintf(stderr, "gpe/metal: malformed dispatch args\n");
             return;
         }
-
-        MTL::CommandBuffer* commands = queue_->commandBuffer();
-        // Wait for whatever was uploaded since the last dispatch, and for
-        // nothing else. Without it a kernel could read a buffer whose blit is
-        // still running; with a full wait instead there would be no overlap
-        // left to have.
-        if (uploadPending_) {
-            commands->encodeWait(uploadEvent_, uploadValue_);
-            uploadPending_ = false;
+        const Kernel& kernel = kernels_[id - 1];
+        // What the kernel's reflection says, when its blob carried it. A
+        // dispatch handed the wrong number of buffers used to bind whatever it
+        // was given to the first slots and render something (openFXplayer
+        // D30); now it is refused, with the kernel's name.
+        if (kernel.info.has_value()) {
+            if (kernel.info->elementBytes.size() != view.bufferCount) {
+                std::fprintf(stderr,
+                             "gpe/metal: %s declares %zu buffers and was handed %u\n",
+                             kernel.name.c_str(), kernel.info->elementBytes.size(),
+                             view.bufferCount);
+                return;
+            }
+            if (kernel.info->uniformBytes != view.uniformBytes) {
+                std::fprintf(stderr,
+                             "gpe/metal: %s declares %u bytes of uniforms and was handed %u\n",
+                             kernel.name.c_str(), kernel.info->uniformBytes,
+                             view.uniformBytes);
+                return;
+            }
         }
-        MTL::ComputeCommandEncoder* encoder = commands->computeCommandEncoder();
-        encoder->setComputePipelineState(kernels_[id - 1].pipeline);
+
+        // Uploads issued since the batch opened must land before this
+        // kernel, and a wait can only be encoded before a command buffer's
+        // first encoder: so the batch that cannot carry it goes now.
+        if (batch_ != nullptr && uploadPending_) {
+            flushBatch();
+        }
+        openBatch();
+        MTL::ComputeCommandEncoder* encoder = batchEncoder_;
+        encoder->setComputePipelineState(kernel.pipeline);
 
         for (uint32_t i = 0; i < view.bufferCount; ++i) {
             MTL::Buffer** slot = find(view.buffers[i]);
@@ -454,46 +528,39 @@ public:
         // Threads, not threadgroups. `thread_position_in_grid` means Metal will
         // launch a partial group at the edge rather than rounding up, so the
         // grid is exactly what was asked for.
-        const MTL::Size threads = MTL::Size::Make(grid.x, grid.y, grid.z);
-        const MTL::Size perGroup = MTL::Size::Make(kGroupX, kGroupY, 1);
-        encoder->dispatchThreads(threads, perGroup);
-        encoder->endEncoding();
-        noteCompute(commands);
-
-        // Numbered before it is committed, so the handler reports the right
-        // one. Metal runs handlers on its own thread; reportCompleted stores
-        // and returns, which is all a handler is allowed to do.
-        const uint64_t submission = ++submitted_;
-        // The **block** overload, not the std::function one.
-        //
-        // metal-cpp's std::function overload copies it into a `__block`
-        // variable and hands Metal a block that reads it back. The copy
-        // helper writes that byref storage on this thread and Metal's own
-        // thread reads it later, and nothing in between is visible to a race
-        // detector -- so every dispatch produced a ThreadSanitizer report
-        // pointing into MTLCommandBuffer.hpp, thirty of them in one suite
-        // run, drowning the two real races found the same afternoon. The
-        // ordering is genuinely there (the copy completes before commit), but
-        // a warning nobody can act on is a warning everybody learns to
-        // ignore. A block captures `this` and the number by value directly:
-        // no byref storage, no std::function, and the noise is gone at the
-        // source rather than suppressed.
-        commands->addCompletedHandler(^(MTL::CommandBuffer* done) {
-            // The device's own clock, read off the command buffer. Seconds
-            // since an arbitrary epoch, so only the difference means
-            // anything -- which is all that is wanted.
-            const double seconds = done->GPUEndTime() - done->GPUStartTime();
-            reportCompleted(submission, seconds * 1000.0);
-        });
-
-        // Returns without waiting. `sync` is what waits, and the counter above
-        // is what says which submissions have retired without waiting at all.
-        commands->commit();
-        commands->retain();
-        if (previous_ != nullptr) {
-            previous_->release();
+        if (kernel.info.has_value()) {
+            // Whole groups of the kernel's own shape, as D3D, Vulkan and now
+            // the CUDA backend launch them. Clipping the partial group at the
+            // edge -- dispatchThreads -- is what left a 1080-high picture's
+            // last row of tiles with half a group while a kernel sharing group
+            // memory counted on all of it, and a [numthreads(256,1,1)]
+            // reduction run as one thread here and 256 on CUDA. Every kernel
+            // bounds-checks; that rule is what makes whole groups safe.
+            const auto groups = [](uint32_t threads, uint32_t size) {
+                return (threads + size - 1) / size;
+            };
+            const auto& group = kernel.info->threadGroup;
+            encoder->dispatchThreadgroups(
+                MTL::Size::Make(groups(grid.x, group[0]), groups(grid.y, group[1]),
+                                groups(grid.z, group[2])),
+                MTL::Size::Make(group[0], group[1], group[2]));
+        } else {
+            const MTL::Size threads = MTL::Size::Make(grid.x, grid.y, grid.z);
+            const MTL::Size perGroup = MTL::Size::Make(kGroupX, kGroupY, 1);
+            encoder->dispatchThreads(threads, perGroup);
         }
-        previous_ = commands;
+        // Numbered now, reported when the batch it is in completes: the
+        // pool's rule is "everything up to N", which a batch satisfies for
+        // its last number.
+        batchLast_ = ++submitted_;
+        if (++batched_ >= kBatchLimit) {
+            flushBatch();
+        }
+    }
+
+    void flush() override {
+        const ScopedPool drain;
+        flushBatch();
     }
 
     // --- HostStaging -------------------------------------------------------
@@ -543,7 +610,66 @@ public:
         }
     }
 
+    /// The download that does not wait: a blit into a shared buffer of its
+    /// own, and the bytes copied out by the completion handler.
+    ///
+    /// Its own staging buffer rather than `readback_`, which the synchronous
+    /// download reuses on the promise that it has finished before returning --
+    /// a promise this call exists not to make.
+    void downloadAsync(BufferId id, void* dst, size_t bytes,
+                       std::function<void(bool)> done) override {
+        const ScopedPool drain;
+        MTL::Buffer** slot = find(id);
+        if (slot == nullptr || *slot == nullptr || dst == nullptr || bytes == 0) {
+            if (done) {
+                done(false);
+            }
+            return;
+        }
+        MTL::Buffer* staging = takeReadbackStaging(bytes);
+        if (staging == nullptr) {
+            if (done) {
+                done(false);
+            }
+            return;
+        }
+        flushBatch();
+        MTL::CommandBuffer* commands = queue_->commandBuffer();
+        if (uploadPending_) {
+            commands->encodeWait(uploadEvent_, uploadValue_);
+            uploadPending_ = false;
+        }
+        MTL::BlitCommandEncoder* blit = commands->blitCommandEncoder();
+        blit->copyFromBuffer(*slot, 0, staging, 0, bytes);
+        blit->endEncoding();
+        // A copy of the callable on the heap, captured by pointer: a block that
+        // captured a std::function by value would copy it through byref storage
+        // on two threads, the race the dispatch handler below already avoids.
+        auto* callback = new std::function<void(bool)>(std::move(done));
+        commands->addCompletedHandler(^(MTL::CommandBuffer* finished) {
+            const bool fine = finished->status() == MTL::CommandBufferStatusCompleted;
+            if (fine) {
+                std::memcpy(dst, staging->contents(), bytes);
+            }
+            returnReadbackStaging(staging);
+            if (*callback) {
+                (*callback)(fine);
+            }
+            delete callback;
+        });
+        commands->commit();
+        commands->retain();
+        if (previous_ != nullptr) {
+            previous_->release();
+        }
+        previous_ = commands;
+    }
+
     void sync() override {
+        {
+            const ScopedPool drain;
+            flushBatch();
+        }
         // Both queues: a caller asking for everything to be finished means the
         // transfers as well as the work.
         if (lastBlit_ != nullptr) {
@@ -569,6 +695,8 @@ private:
     struct Kernel {
         std::string                name;
         MTL::ComputePipelineState* pipeline = nullptr;
+        /// The blob's trailer, if it had one. See gpe/kernels.h.
+        std::optional<KernelInfo>  info;
     };
 
     /// Matches [numthreads(16, 16, 1)] in the kernels and the CUDA backend.
@@ -631,6 +759,98 @@ private:
         return slot.buffer;
     }
 
+    /// Staging for downloadAsync, kept rather than made per call: a display
+    /// that reads back every frame asked the driver for a new shared buffer
+    /// sixty times a second. Taken on this thread, returned from Metal's
+    /// completion thread, hence the lock.
+    MTL::Buffer* takeReadbackStaging(size_t bytes) {
+        {
+            const std::lock_guard<std::mutex> held(stagingGuard_);
+            for (auto it = spareStaging_.begin(); it != spareStaging_.end(); ++it) {
+                if ((*it)->length() >= bytes) {
+                    MTL::Buffer* found = *it;
+                    spareStaging_.erase(it);
+                    return found;
+                }
+            }
+        }
+        return device_->newBuffer(bytes, MTL::ResourceStorageModeShared);
+    }
+
+    void returnReadbackStaging(MTL::Buffer* staging) {
+        const std::lock_guard<std::mutex> held(stagingGuard_);
+        if (spareStaging_.size() < kSpareStaging) {
+            spareStaging_.push_back(staging);
+        } else {
+            staging->release();
+        }
+    }
+
+    /// BATCHING
+    ///
+    /// Dispatches are encoded into one open command buffer and committed
+    /// together, not one command buffer each. Measured on an M5 Pro, 2000
+    /// small dispatches: a command buffer, encoder, completion block and
+    /// commit apiece cost 12-15 us of CPU per dispatch, nearly all of the
+    /// time; batched, about 1 us to queue and 3.5 us including the device's
+    /// work (tests/test_dispatch_order.cpp).
+    ///
+    /// The batch goes -- is committed, never waited for -- at every point
+    /// something must run after what it holds: an upload (which orders itself
+    /// behind compute), a download, a fill, sync(), flush(), a dispatch that
+    /// must wait for an upload, and every kBatchLimit dispatches so that work
+    /// keeps flowing to the device inside a long frame. A host that shares
+    /// this queue with another runtime calls flush() before that runtime
+    /// submits work reading gpe's results.
+    void openBatch() {
+        if (batch_ != nullptr) {
+            return;
+        }
+        batch_ = queue_->commandBuffer()->retain();
+        // Wait for whatever was uploaded since the last batch, and for nothing
+        // else. Without it a kernel could read a buffer whose blit is still
+        // running; with a full wait instead there would be no overlap left.
+        if (uploadPending_) {
+            batch_->encodeWait(uploadEvent_, uploadValue_);
+            uploadPending_ = false;
+        }
+        batchEncoder_ = batch_->computeCommandEncoder()->retain();
+    }
+
+    void flushBatch() {
+        if (batch_ == nullptr) {
+            return;
+        }
+        batchEncoder_->endEncoding();
+        batchEncoder_->release();
+        batchEncoder_ = nullptr;
+        noteCompute(batch_);
+        const uint64_t submission = batchLast_;
+        // The **block** overload, not the std::function one.
+        //
+        // metal-cpp's std::function overload copies it into a `__block`
+        // variable and hands Metal a block that reads it back. The copy
+        // helper writes that byref storage on this thread and Metal's own
+        // thread reads it later, and nothing in between is visible to a race
+        // detector -- so every dispatch produced a ThreadSanitizer report
+        // pointing into MTLCommandBuffer.hpp. A block captures `this` and the
+        // number by value directly: no byref storage, no std::function.
+        batch_->addCompletedHandler(^(MTL::CommandBuffer* done) {
+            // The device's own clock, read off the command buffer: the whole
+            // batch, which is what a frame's dispatches are.
+            const double seconds = done->GPUEndTime() - done->GPUStartTime();
+            reportCompleted(submission, seconds * 1000.0);
+        });
+        // Returns without waiting. `sync` is what waits.
+        batch_->commit();
+        if (previous_ != nullptr) {
+            previous_->release();
+        }
+        previous_ = batch_;   // already retained
+        batch_ = nullptr;
+        batched_ = 0;
+    }
+
     /// Remembers that the compute queue has work an upload must not overtake.
     void noteCompute(MTL::CommandBuffer* commands) {
         commands->encodeSignalEvent(computeEvent_, ++computeValue_);
@@ -687,6 +907,16 @@ private:
     Staging             uploads_[kUploadSlots]{};
     int                 uploadAt_ = 0;
     MTL::CommandBuffer* previous_ = nullptr;
+    /// The open batch. See openBatch.
+    MTL::CommandBuffer*         batch_ = nullptr;
+    MTL::ComputeCommandEncoder* batchEncoder_ = nullptr;
+    uint32_t                    batched_ = 0;
+    uint64_t                    batchLast_ = 0;
+    static constexpr uint32_t   kBatchLimit = 64;
+    /// Spare downloadAsync staging buffers. See takeReadbackStaging.
+    std::mutex                  stagingGuard_;
+    std::vector<MTL::Buffer*>   spareStaging_;
+    static constexpr size_t     kSpareStaging = 4;
     /// This backend's own count, which matches the pool's because both
     /// increment once per dispatch and nothing else.
     uint64_t            submitted_ = 0;
@@ -705,6 +935,18 @@ std::unique_ptr<Device> adoptMetalDevice(void* mtlDevice) {
     }
     return device;
 }
+
+std::unique_ptr<Device> adoptMetalDevice(void* mtlDevice, void* mtlCommandQueue) {
+    auto device = std::make_unique<MetalDevice>();
+    if (!device->adopt(static_cast<MTL::Device*>(mtlDevice),
+                       static_cast<MTL::CommandQueue*>(mtlCommandQueue))) {
+        return nullptr;
+    }
+    return device;
+}
+
+// No CUDA on this backend. Defined so a client that asks links and is told.
+std::unique_ptr<Device> adoptCudaContext(void*, void*) { return nullptr; }
 
 std::unique_ptr<Device> Device::create() {
     auto device = std::make_unique<MetalDevice>();

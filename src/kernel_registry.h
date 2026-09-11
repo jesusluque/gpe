@@ -10,11 +10,23 @@
 
 #include <string_view>
 
+#include "gpe/kernels.h"
 #include "gpe_kernels.h"
 
 namespace gpe::kernels {
 
-/// The blob called `name`, compiled in or registered, or null.
+/// A kernel ready for a backend: the payload with any trailer removed, and
+/// what the trailer said.
+struct Resolved {
+    Blob                      blob;   ///< `size` excludes the trailer
+    std::optional<KernelInfo> info;
+};
+
+/// The kernel called `name`, compiled in or registered, or null. The pointer
+/// stays valid for the life of the process.
+[[nodiscard]] const Resolved* resolve(std::string_view name);
+
+/// The raw table entry (trailer included), compiled in or registered, or null.
 [[nodiscard]] const Blob* lookup(std::string_view name);
 
 }   // namespace gpe::kernels
