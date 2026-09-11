@@ -81,7 +81,24 @@ public:
     /// The baking is the host's job, not this class's: OCIO belongs to whoever
     /// owns the config, and an engine that linked it would be an engine with an
     /// opinion about colour management.
-    [[nodiscard]] bool setLut(const float* rgba, int size, float min, float max);
+    /// How the lattice spans its range. See lutInput.
+    enum class LutDomain { Linear, Log2 };
+
+    [[nodiscard]] bool setLut(const float* rgba, int size, float min, float max,
+                              LutDomain domain = LutDomain::Linear);
+
+    /// The linear colour at every lattice point, red fastest, three floats
+    /// each: what the host runs its display transform over to bake the
+    /// lattice for `setLut` with the same size, range and domain. The one
+    /// place the shaper is written on the host side, so the host and the
+    /// kernel cannot disagree about where a lattice point is.
+    ///
+    /// `Log2` for scene-linear pictures: a 33-cube over linear 0..16 has cells
+    /// half a unit wide, so everything below 0.5 -- the shadows and the
+    /// mid-tones -- interpolates across one cell. Spread in stops between,
+    /// say, 2^-10 and 16, every cell is under a stop wide. Values at or below
+    /// `min` show as `min`: choose it below anything a display can show.
+    static void lutInput(int size, float min, float max, LutDomain domain, std::vector<float>& rgb);
 
     /// Transforms, downsamples and packs `source` into the presenter's size,
     /// downloads it, and hands it over.
@@ -151,6 +168,7 @@ private:
     int                        lutSize_ = 0;
     float                      lutMin_ = 0.0f;
     float                      lutMax_ = 1.0f;
+    LutDomain                  lutDomain_ = LutDomain::Linear;
     uint64_t                   presented_ = 0;
     size_t                     lastBytes_ = 0;
 };

@@ -6,6 +6,7 @@
 // And that the transfer function is the piecewise sRGB curve rather than a 2.2
 // approximation, because the difference lives in the shadows, which is where a
 // viewer gets looked at hardest.
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -446,6 +447,92 @@ int main() {
     }
 
     device.release(source);
+    // --- a log2 shaper keeps the shadows of a wide scene-linear range ----------
+    {
+        const BufferId shaped = device.alloc(srcBytes);
+        // A lattice baked from lutInput with the sRGB curve standing in for
+        // the host's display transform. Over linear 0..16 on 33 points the
+        // first cell is half a unit wide and a shadow value is a blend of
+        // black and 0.5's code value; spread in stops from 2^-10 to 16 it
+        // lands within a code value of the curve.
+        constexpr int kN = 33;
+        const auto bake = [](int size, float min, float max, DisplayPass::LutDomain domain) {
+            std::vector<float> in;
+            DisplayPass::lutInput(size, min, max, domain, in);
+            std::vector<float> lattice(in.size() / 3 * 4);
+            for (size_t k = 0; k < in.size() / 3; ++k) {
+                for (int c = 0; c < 3; ++c) {
+                    lattice[k * 4 + static_cast<size_t>(c)] = static_cast<float>(srgb(std::max(in[k * 3 + static_cast<size_t>(c)], 0.0f)));
+                }
+                lattice[k * 4 + 3] = 1.0f;
+            }
+            return lattice;
+        };
+        const float shadow = 0.01f;
+        std::vector<float> plate(size_t{kSrcW} * kSrcH * 4, shadow);
+        for (size_t i = 3; i < plate.size(); i += 4) {
+            plate[i] = 1.0f;
+        }
+        device.upload(shaped, plate.data(), srcBytes);
+        const int wanted = static_cast<int>(std::lround(srgb(shadow) * 255.0));
+        const auto through = [&](DisplayPass::LutDomain domain, float min) {
+            const std::vector<float> lattice = bake(kN, min, 16.0f, domain);
+            check(pass.setLut(lattice.data(), kN, min, 16.0f, domain), "the shaped lattice uploads");
+            Capture capture(kSrcW, kSrcH);
+            pass.present(Image{shaped, kSrcW, kSrcH, kSrcW}, capture, DisplayControls{}, 14);
+            return static_cast<int>(capture.at(2, 2, 0));
+        };
+        const int even = through(DisplayPass::LutDomain::Linear, 0.0f);
+        const int stops = through(DisplayPass::LutDomain::Log2, 1.0f / 1024.0f);
+        std::printf("test_display: linear 0.01 through a 33-cube over 0..16: curve %d, even %d, log2 %d\n",
+                    wanted, even, stops);
+        check(std::abs(stops - wanted) <= 1, "a log2-shaped lattice holds a shadow within a code value");
+        check(std::abs(even - wanted) > 4, "where an even lattice over the same range does not");
+        check(pass.setLut(nullptr, 0, 0.0f, 1.0f), "and the lattice comes off again");
+        device.release(shaped);
+    }
+
+    // --- dither: the mean survives rounding, the noise stays within a code ----
+    {
+        const BufferId shaped = device.alloc(srcBytes);
+        // A flat value 0.4 of a code value above 100 after the sRGB curve.
+        const double target = (100.4 / 255.0 + 0.055) / 1.055;
+        const float linear = static_cast<float>(std::pow(target, 2.4));
+        std::vector<float> plate(size_t{kSrcW} * kSrcH * 4, linear);
+        for (size_t i = 3; i < plate.size(); i += 4) {
+            plate[i] = 1.0f;
+        }
+        device.upload(shaped, plate.data(), srcBytes);
+        const auto stats = [&](bool dither, double& mean, int& lo, int& hi) {
+            DisplayControls controls;
+            controls.dither = dither;
+            Capture capture(kSrcW, kSrcH);
+            pass.present(Image{shaped, kSrcW, kSrcH, kSrcW}, capture, controls, 15);
+            double sum = 0.0;
+            lo = 255;
+            hi = 0;
+            for (int y = 0; y < kSrcH; ++y) {
+                for (int x = 0; x < kSrcW; ++x) {
+                    const int v = capture.at(x, y, 0);
+                    sum += v;
+                    lo = std::min(lo, v);
+                    hi = std::max(hi, v);
+                }
+            }
+            mean = sum / (kSrcW * kSrcH);
+        };
+        double plainMean = 0.0, ditheredMean = 0.0;
+        int plainLo = 0, plainHi = 0, lo = 0, hi = 0;
+        stats(false, plainMean, plainLo, plainHi);
+        stats(true, ditheredMean, lo, hi);
+        std::printf("test_display: 100.4 rounds to %.2f plain, %.2f dithered (%d..%d)\n", plainMean,
+                    ditheredMean, lo, hi);
+        check(plainLo == 100 && plainHi == 100, "without dither a flat value rounds to one code");
+        check(std::abs(ditheredMean - 100.4) < 0.1, "with it the mean of the area is the value");
+        check(lo >= 99 && hi <= 102, "and no pixel moves more than a code value and a half");
+        device.release(shaped);
+    }
+
     // --- late readback: never waits, a frame behind, same pixels -------------
     {
         // A flat grey plate and a flat white one on alternate frames, so a

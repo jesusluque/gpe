@@ -2,6 +2,7 @@
 #include "display.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <thread>
 
@@ -38,8 +39,10 @@ struct DisplayUniforms {
     float    viewOriginY = 0.0f;
     float    viewPerPixelX = 1.0f;
     float    viewPerPixelY = 1.0f;
+    uint32_t lutShaper = 0;
+    uint32_t dither = 0;
 };
-static_assert(sizeof(DisplayUniforms) == 100, "no padding, on any compiler");
+static_assert(sizeof(DisplayUniforms) == 108, "no padding, on any compiler");
 
 }   // namespace
 
@@ -69,7 +72,33 @@ void DisplayPass::releaseTargets() {
     }
 }
 
-bool DisplayPass::setLut(const float* rgba, int size, float min, float max) {
+void DisplayPass::lutInput(int size, float min, float max, LutDomain domain, std::vector<float>& rgb) {
+    rgb.assign(size >= 2 ? static_cast<size_t>(size) * size * size * 3 : 0, 0.0f);
+    if (size < 2) {
+        return;
+    }
+    const auto at = [&](int k) {
+        const double unit = static_cast<double>(k) / (size - 1);
+        if (domain == LutDomain::Log2) {
+            const double lo = std::log2(std::max(static_cast<double>(min), 1e-10));
+            const double hi = std::log2(std::max(static_cast<double>(max), static_cast<double>(min) * 2.0));
+            return static_cast<float>(std::pow(2.0, lo + unit * (hi - lo)));
+        }
+        return static_cast<float>(min + unit * (max - min));
+    };
+    size_t out = 0;
+    for (int b = 0; b < size; ++b) {
+        for (int g = 0; g < size; ++g) {
+            for (int r = 0; r < size; ++r) {
+                rgb[out++] = at(r);
+                rgb[out++] = at(g);
+                rgb[out++] = at(b);
+            }
+        }
+    }
+}
+
+bool DisplayPass::setLut(const float* rgba, int size, float min, float max, LutDomain domain) {
     if (lut_ != kInvalidBuffer) {
         device_->release(lut_);
         lut_ = kInvalidBuffer;
@@ -91,6 +120,7 @@ bool DisplayPass::setLut(const float* rgba, int size, float min, float max) {
     lutSize_ = size;
     lutMin_ = min;
     lutMax_ = max;
+    lutDomain_ = domain;
     return true;
 }
 
@@ -304,7 +334,9 @@ void DisplayPass::dispatchInto(Target& target, const Image& source, const Image&
                                         static_cast<float>(width),
             view.perPixelY > 0.0f ? view.perPixelY
                                   : static_cast<float>(source.h) /
-                                        static_cast<float>(height)});
+                                        static_cast<float>(height),
+            lutDomain_ == LutDomain::Log2 ? 1u : 0u,
+            controls.dither ? 1u : 0u});
     device_->dispatch(kernel_,
                       Grid{static_cast<uint32_t>(width),
                            static_cast<uint32_t>(height), 1},
