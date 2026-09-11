@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <thread>
 
 #include "gpe/args.h"
 
@@ -43,13 +44,28 @@ static_assert(sizeof(DisplayUniforms) == 100, "no padding, on any compiler");
 }   // namespace
 
 DisplayPass::~DisplayPass() {
-    for (const Target& target : targets_) {
-        if (target.buffer != kInvalidBuffer) {
-            device_->release(target.buffer);
-        }
-    }
+    releaseTargets();
     if (lut_ != kInvalidBuffer) {
         device_->release(lut_);
+    }
+}
+
+void DisplayPass::releaseTargets() {
+    // A readback still on its way writes into a target's host vector from the
+    // device's completion thread: wait for every one before letting go.
+    device_->sync();
+    for (Target& target : targets_) {
+        for (int spins = 0; spins < 100000 && target.state.load() == kPending && target.shared == nullptr;
+             ++spins) {
+            std::this_thread::yield();
+        }
+        if (target.buffer != kInvalidBuffer) {
+            device_->release(target.buffer);
+            target.buffer = kInvalidBuffer;
+        }
+        target.shared = nullptr;
+        target.host.clear();
+        target.state.store(kIdle);
     }
 }
 
@@ -89,16 +105,29 @@ bool DisplayPass::prepare(int maxWidth, int maxHeight) {
     // One uint per pixel: packed RGBA8.
     const size_t bytes =
         static_cast<size_t>(maxWidth) * static_cast<size_t>(maxHeight) * 4;
-    for (Target& target : targets_) {
-        if (target.buffer != kInvalidBuffer) {
-            device_->release(target.buffer);
+    releaseTargets();
+    for (int k = 0; k < usableTargets(); ++k) {
+        Target& target = targets_[k];
+        if (mode_ == Readback::Late) {
+            // Memory both sides address, where the machine has it: then there
+            // is nothing to read back, only a moment to wait for.
+            target.shared = useShared_ ? static_cast<unsigned char*>(device_->allocShared(bytes, target.buffer))
+                                       : nullptr;
+            if (target.shared == nullptr) {
+                target.buffer = device_->alloc(bytes);
+                target.host.assign(bytes, 0);
+            }
+        } else {
+            target.buffer = device_->alloc(bytes);
         }
-        target.buffer = device_->alloc(bytes);
         if (target.buffer == kInvalidBuffer) {
             return false;
         }
     }
-    host_.assign(bytes, 0);
+    host_.assign(mode_ == Readback::Wait ? bytes : 0, 0);
+    ordered_ = 0;
+    shownOrder_ = 0;
+    at_ = 0;
     if (lut_ == kInvalidBuffer) {
         // One black sample, so the binding is always valid even with no
         // transform. Sixteen bytes to remove a null dereference from a kernel.
@@ -139,9 +168,107 @@ void DisplayPass::presentWipe(const Image& source, const Image& right,
     width = std::min(width, maxWidth_);
     height = std::min(height, maxHeight_);
 
-    const Target& target = targets_[at_];
-    at_ = (at_ + 1) % kBuffers;
+    if (mode_ == Readback::Wait) {
+        Target& target = targets_[at_];
+        at_ = (at_ + 1) % usableTargets();
+        dispatchInto(target, source, right, controls, width, height, view);
+        const size_t bytes = static_cast<size_t>(width) *
+                             static_cast<size_t>(height) * 4;
+        device_->download(host_.data(), target.buffer, bytes);
+        presenter.present(host_.data(), width, height, frame);
+        ++presented_;
+        lastBytes_ = bytes;
+        return;
+    }
 
+    drain(presenter);
+    int free = idleTarget();
+    if (free < 0) {
+        // Every target is still travelling: the device is more than two
+        // frames behind. Wait for it -- the only wait this mode has, and one
+        // that means a deadline was already missed.
+        device_->sync();
+        drain(presenter);
+        free = idleTarget();
+        if (free < 0) {
+            return;
+        }
+    }
+    Target& target = targets_[free];
+    target.order = ++ordered_;
+    target.frame = frame;
+    target.width = width;
+    target.height = height;
+    target.state.store(kPending);
+    dispatchInto(target, source, right, controls, width, height, view);
+    const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
+    if (target.shared != nullptr) {
+        target.at = device_->submission();
+        // Committed now, so it can finish before the next frame asks.
+        device_->flush();
+    } else {
+        std::atomic<int>* state = &target.state;
+        device_->downloadAsync(target.buffer, target.host.data(), bytes,
+                               [state](bool fine) { state->store(fine ? kReady : kFailed); });
+    }
+}
+
+int DisplayPass::idleTarget() {
+    for (int k = 0; k < usableTargets(); ++k) {
+        int state = targets_[k].state.load();
+        if (state == kFailed) {
+            targets_[k].state.store(kIdle);
+            state = kIdle;
+        }
+        if (state == kIdle) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+void DisplayPass::drain(Presenter& presenter) {
+    if (mode_ != Readback::Late) {
+        return;
+    }
+    device_->reclaim();
+    Target* newest = nullptr;
+    for (int k = 0; k < usableTargets(); ++k) {
+        Target& target = targets_[k];
+        if (target.shared != nullptr && target.state.load() == kPending && device_->retired(target.at)) {
+            target.state.store(kReady);
+        }
+        if (target.state.load() == kReady && (newest == nullptr || target.order > newest->order)) {
+            newest = &target;
+        }
+    }
+    if (newest == nullptr) {
+        return;
+    }
+    for (int k = 0; k < usableTargets(); ++k) {
+        Target& target = targets_[k];
+        if (&target != newest && target.state.load() == kReady && target.order < newest->order) {
+            target.state.store(kIdle);
+            if (target.order > shownOrder_) {
+                ++overtaken_;
+            }
+        }
+    }
+    if (newest->order > shownOrder_) {
+        const unsigned char* pixels = newest->shared != nullptr ? newest->shared : newest->host.data();
+        presenter.present(pixels, newest->width, newest->height, newest->frame);
+        ++presented_;
+        lastBytes_ = static_cast<size_t>(newest->width) * static_cast<size_t>(newest->height) * 4;
+        shownOrder_ = newest->order;
+    }
+    // The newest stays Ready, not Idle, until something newer arrives: a
+    // drain with nothing new then has nothing to hand over, and a buffer the
+    // presenter may still be showing is not rewritten.
+}
+
+void DisplayPass::dispatchInto(Target& target, const Image& source, const Image& right,
+                               const DisplayControls& controls, int width, int height,
+                               const DisplayView& view) {
     Args args;
     // The target is packed RGBA8: one uint per pixel, four bytes an element.
     // The second side is always bound, because a kernel with an unbound buffer
@@ -183,12 +310,6 @@ void DisplayPass::presentWipe(const Image& source, const Image& right,
                            static_cast<uint32_t>(height), 1},
                       args.data(), args.size());
 
-    const size_t bytes = static_cast<size_t>(width) *
-                         static_cast<size_t>(height) * 4;
-    device_->download(host_.data(), target.buffer, bytes);
-    presenter.present(host_.data(), width, height, frame);
-    ++presented_;
-    lastBytes_ = bytes;
 }
 
 }   // namespace gpe

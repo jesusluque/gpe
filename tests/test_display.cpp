@@ -6,6 +6,7 @@
 // And that the transfer function is the piecewise sRGB curve rather than a 2.2
 // approximation, because the difference lives in the shadows, which is where a
 // viewer gets looked at hardest.
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -445,6 +446,119 @@ int main() {
     }
 
     device.release(source);
+    // --- late readback: never waits, a frame behind, same pixels -------------
+    {
+        // A flat grey plate and a flat white one on alternate frames, so a
+        // picture handed over under the wrong frame number is visible.
+        std::vector<float> grey(size_t{kSrcW} * kSrcH * 4, 0.18f);
+        std::vector<float> white(size_t{kSrcW} * kSrcH * 4, 1.0f);
+        for (size_t i = 3; i < grey.size(); i += 4) {
+            grey[i] = 1.0f;
+        }
+        const BufferId greySource = device.alloc(srcBytes);
+        const BufferId whiteSource = device.alloc(srcBytes);
+        device.upload(greySource, grey.data(), srcBytes);
+        device.upload(whiteSource, white.data(), srcBytes);
+
+        DisplayControls flat;
+        flat.checkerboard = false;
+        Capture reference(kSrcW, kSrcH);
+        pass.present(Image{greySource, kSrcW, kSrcH, kSrcW}, reference, flat, 0);
+        const unsigned char greyCode = reference.at(3, 3, 0);
+
+        for (const bool shared : {true, false}) {
+        DisplayPass late(device);
+        late.setReadback(DisplayPass::Readback::Late, shared);
+        check(late.prepare(kSrcW, kSrcH), "a late-readback pass prepares");
+
+        /// Checks, as each picture arrives, that frames only go forward and
+        /// that each carries its own plate.
+        class Ordered final : public Presenter {
+        public:
+            explicit Ordered(unsigned char grey) : grey_(grey) {}
+            void targetSize(int& width, int& height) const override {
+                width = kSrcW;
+                height = kSrcH;
+            }
+            void present(const void* rgba8, int, int, uint64_t frame) override {
+                const auto* bytes = static_cast<const unsigned char*>(rgba8);
+                const unsigned char code = bytes[(3 * kSrcW + 3) * 4];
+                forward = forward && (count == 0 || frame > last);
+                matches = matches && code == ((frame % 2) == 0 ? grey_ : 255);
+                last = frame;
+                ++count;
+            }
+            unsigned char grey_;
+            uint64_t      last = 0;
+            int           count = 0;
+            bool          forward = true;
+            bool          matches = true;
+        } ordered(greyCode);
+
+        constexpr int kFrames = 40;
+        for (int f = 0; f < kFrames; ++f) {
+            const BufferId plate = (f % 2) == 0 ? greySource : whiteSource;
+            late.present(Image{plate, kSrcW, kSrcH, kSrcW}, ordered, flat, static_cast<uint64_t>(f));
+        }
+        device.sync();
+        late.drain(ordered);
+
+        check(ordered.forward, "late readback hands frames over in order");
+        check(ordered.matches, "each picture arrives under its own frame number");
+        check(ordered.last == kFrames - 1, "and after a drain the last frame asked for is the one shown");
+        check(ordered.count + static_cast<int>(late.overtaken()) <= kFrames,
+              "no picture is shown twice");
+        std::printf("test_display: late readback (%s) showed %d of %d frames, %llu overtaken\n",
+                    shared ? "shared memory" : "downloadAsync", ordered.count, kFrames,
+                    static_cast<unsigned long long>(late.overtaken()));
+        }
+
+        device.release(greySource);
+        device.release(whiteSource);
+    }
+
+    // --- what each readback costs the thread that presents, at 1080p ---------
+    {
+        constexpr int kW = 1920;
+        constexpr int kH = 1080;
+        const size_t bytes = size_t{kW} * kH * 16;
+        const BufferId plate = device.alloc(bytes);
+        std::vector<float> pixels(size_t{kW} * kH * 4, 0.5f);
+        device.upload(plate, pixels.data(), bytes);
+        class Sink final : public Presenter {
+        public:
+            void targetSize(int& width, int& height) const override {
+                width = kW;
+                height = kH;
+            }
+            void present(const void*, int, int, uint64_t) override {}
+        } sink;
+        const auto timed = [&](DisplayPass::Readback mode, bool shared) {
+            DisplayPass timedPass(device);
+            timedPass.setReadback(mode, shared);
+            if (!timedPass.prepare(kW, kH)) {
+                return -1.0;
+            }
+            for (int f = 0; f < 5; ++f) {   // warm: kernel load, first allocations
+                timedPass.present(Image{plate, kW, kH, kW}, sink, DisplayControls{}, 0);
+            }
+            device.sync();
+            constexpr int kFrames = 60;
+            const auto start = std::chrono::steady_clock::now();
+            for (int f = 0; f < kFrames; ++f) {
+                timedPass.present(Image{plate, kW, kH, kW}, sink, DisplayControls{}, static_cast<uint64_t>(f));
+            }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            device.sync();
+            return ms / kFrames;
+        };
+        std::printf("test_display: 1080p present on the calling thread: wait %.2f ms, late %.2f ms "
+                    "(shared memory), late %.2f ms (downloadAsync)\n",
+                    timed(DisplayPass::Readback::Wait, true), timed(DisplayPass::Readback::Late, true),
+                    timed(DisplayPass::Readback::Late, false));
+        device.release(plate);
+    }
+
     device.sync();
 
     if (failures == 0) {

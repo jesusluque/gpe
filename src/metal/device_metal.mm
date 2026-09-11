@@ -41,6 +41,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <functional>
 #include <optional>
 #include <string>
@@ -114,6 +115,9 @@ public:
         }
         if (readback_ != nullptr) {
             readback_->release();
+        }
+        for (MTL::Buffer* spare : spareStaging_) {
+            spare->release();
         }
         if (uploadEvent_ != nullptr) {
             uploadEvent_->release();
@@ -622,7 +626,7 @@ public:
             }
             return;
         }
-        MTL::Buffer* staging = device_->newBuffer(bytes, MTL::ResourceStorageModeShared);
+        MTL::Buffer* staging = takeReadbackStaging(bytes);
         if (staging == nullptr) {
             if (done) {
                 done(false);
@@ -647,7 +651,7 @@ public:
             if (fine) {
                 std::memcpy(dst, staging->contents(), bytes);
             }
-            staging->release();
+            returnReadbackStaging(staging);
             if (*callback) {
                 (*callback)(fine);
             }
@@ -753,6 +757,33 @@ private:
         }
         slot.buffer = device_->newBuffer(bytes, MTL::ResourceStorageModeShared);
         return slot.buffer;
+    }
+
+    /// Staging for downloadAsync, kept rather than made per call: a display
+    /// that reads back every frame asked the driver for a new shared buffer
+    /// sixty times a second. Taken on this thread, returned from Metal's
+    /// completion thread, hence the lock.
+    MTL::Buffer* takeReadbackStaging(size_t bytes) {
+        {
+            const std::lock_guard<std::mutex> held(stagingGuard_);
+            for (auto it = spareStaging_.begin(); it != spareStaging_.end(); ++it) {
+                if ((*it)->length() >= bytes) {
+                    MTL::Buffer* found = *it;
+                    spareStaging_.erase(it);
+                    return found;
+                }
+            }
+        }
+        return device_->newBuffer(bytes, MTL::ResourceStorageModeShared);
+    }
+
+    void returnReadbackStaging(MTL::Buffer* staging) {
+        const std::lock_guard<std::mutex> held(stagingGuard_);
+        if (spareStaging_.size() < kSpareStaging) {
+            spareStaging_.push_back(staging);
+        } else {
+            staging->release();
+        }
     }
 
     /// BATCHING
@@ -882,6 +913,10 @@ private:
     uint32_t                    batched_ = 0;
     uint64_t                    batchLast_ = 0;
     static constexpr uint32_t   kBatchLimit = 64;
+    /// Spare downloadAsync staging buffers. See takeReadbackStaging.
+    std::mutex                  stagingGuard_;
+    std::vector<MTL::Buffer*>   spareStaging_;
+    static constexpr size_t     kSpareStaging = 4;
     /// This backend's own count, which matches the pool's because both
     /// increment once per dispatch and nothing else.
     uint64_t            submitted_ = 0;
