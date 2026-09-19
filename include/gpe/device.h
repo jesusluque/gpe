@@ -179,6 +179,17 @@ public:
         available = 0;
     }
 
+    /// Bind this device to the calling thread.
+    ///
+    /// Every gpe entry point does this for itself, so gpe's own work needs no
+    /// help. What needs it is a client reaching the same context through
+    /// another API -- the renderer whose context this one adopted -- from a
+    /// thread gpe has not run on: CUDA's current context is per-thread, and
+    /// the first driver call from a fresh thread fails without one. A TLS
+    /// write, idempotent and cheap, and nothing at all where the backend
+    /// keeps no such state.
+    virtual void bindThread() const {}
+
     virtual ~Device() = default;
 };
 
