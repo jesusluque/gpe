@@ -61,6 +61,24 @@ public:
         return false;
     }
 
+    /// `bytes` from one device buffer into another, on the device.
+    ///
+    /// The same argument `fill` makes. The caller this exists for is moving a
+    /// picture between an allocation the pool made and one that can be shared
+    /// with another process, and doing that through host memory would be two
+    /// crossings of the bus to move something that never leaves the card:
+    /// tens of microseconds against milliseconds each way.
+    ///
+    /// Queued on the same stream as everything else, so it orders itself
+    /// against the kernels either side of it without a synchronise.
+    ///
+    /// False where the backend cannot, and the caller downloads and uploads --
+    /// slower, and not a missing capability.
+    [[nodiscard]] virtual bool copy(BufferId /*destination*/,
+                                    BufferId /*source*/, size_t /*bytes*/) {
+        return false;
+    }
+
     // --- work --------------------------------------------------------------
 
     /// A kernel by name, from the blobs built into the binary. Compiling

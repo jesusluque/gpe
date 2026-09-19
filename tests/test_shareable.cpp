@@ -23,6 +23,7 @@
 #endif
 
 #include "gpe/device.h"
+#include "gpe/pool.h"
 
 namespace {
 
@@ -133,6 +134,41 @@ int main() {
 
     closeHandle(handle);
     device->release(shared);
+
+    // --- through the pool, which is what a host actually holds --------------
+    //
+    // Everything above is the backend. `PooledDevice` is what openFXplayer
+    // has, and a call it does not forward falls back to the base class's
+    // "cannot" -- silently, and at the point furthest from the omission.
+    {
+        PooledDevice pooled(Device::create(), size_t{256} << 20);
+        const BufferId ordinary = pooled.alloc(kBytes);
+        check(ordinary != kInvalidBuffer, "the pool still allocates");
+        check(pooled.exportShareable(ordinary) == 0,
+              "and a pooled buffer cannot be exported");
+
+        const BufferId crossable = pooled.allocShareable(kBytes);
+        check(crossable != kInvalidBuffer, "the pool makes a shareable one");
+        const uint64_t pooledHandle = pooled.exportShareable(crossable);
+        check(pooledHandle != 0, "and exports it, generation and all");
+
+        // The copy on the card, which is how a picture the pool made reaches a
+        // buffer that can cross without touching the bus.
+        pooled.upload(ordinary, written.data(), kBytes);
+        check(pooled.copy(crossable, ordinary, kBytes),
+              "a device-to-device copy moves it across");
+        pooled.sync();
+        std::vector<uint32_t> moved(kCount, 0);
+        pooled.download(moved.data(), crossable, kBytes);
+        pooled.sync();
+        check(moved == written, "and what arrives is what was there");
+
+        if (pooledHandle != 0) {
+            closeHandle(pooledHandle);
+        }
+        pooled.release(crossable);
+        pooled.release(ordinary);
+    }
 
     if (failures > 0) {
         std::fprintf(stderr, "test_shareable: %d failure(s)\n", failures);

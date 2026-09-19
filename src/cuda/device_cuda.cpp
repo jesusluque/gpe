@@ -624,6 +624,26 @@ public:
         return true;
     }
 
+    [[nodiscard]] bool copy(BufferId destination, BufferId source,
+                            size_t bytes) override {
+        ensureCurrent();
+        const Allocation* to = find(destination);
+        const Allocation* from = find(source);
+        if (to == nullptr || from == nullptr || bytes == 0 ||
+            bytes > to->bytes || bytes > from->bytes) {
+            return false;
+        }
+        // On the compute stream, for the reason `fill` is on it: a copy that
+        // ran ahead of the kernel still writing the source would carry the
+        // picture from before, and only sometimes.
+        if (!ok(cuMemcpyDtoDAsync(to->ptr, from->ptr, bytes, stream_),
+                "memcpyDtoDAsync")) {
+            return false;
+        }
+        noteCompute();
+        return true;
+    }
+
     [[nodiscard]] KernelId load(std::string_view name) override {
         ensureCurrent();
         for (size_t i = 0; i < kernels_.size(); ++i) {

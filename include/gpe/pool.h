@@ -138,7 +138,17 @@ public:
     /// reuse in it -- the memory belongs to somebody who will take it back --
     /// so it takes a slot, answers while it is live, and the slot is retired
     /// rather than returned to a free list.
+    [[nodiscard]] bool copy(BufferId destination, BufferId source,
+                            size_t bytes) override;
     [[nodiscard]] BufferId adopt(uint64_t devicePtr, size_t bytes) override;
+    /// Never from the free lists: a shareable allocation is two megabytes
+    /// whatever was asked for, and a pool that recycled them as ordinary
+    /// buffers would hand a caller a block another process still holds a
+    /// handle to.
+    [[nodiscard]] BufferId allocShareable(size_t bytes) override;
+    [[nodiscard]] uint64_t exportShareable(BufferId) const override;
+    [[nodiscard]] BufferId importShareable(uint64_t handle,
+                                           size_t bytes) override;
     [[nodiscard]] uint64_t devicePointer(BufferId) const override;
     [[nodiscard]] uint64_t stream() const override;
     /// Resolved through the slot table, like `devicePointer`: a stale handle
