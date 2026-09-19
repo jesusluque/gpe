@@ -130,6 +130,66 @@ public:
         return kInvalidBuffer;
     }
 
+    /// An allocation another process can be given, and the two calls around it.
+    ///
+    /// **What this is for.** A model worker is a separate process -- it has to
+    /// be, because the model's environment is half its install -- and the whole
+    /// design depends on handles crossing that boundary rather than pixels. On
+    /// Linux that has been `cudaIpcGetMemHandle` over an ordinary allocation.
+    /// That family is Linux-only: there is no Windows build of it at any
+    /// driver, and the documented replacement is the virtual-memory API, which
+    /// exports a file descriptor there and an NT handle here.
+    ///
+    /// So sharing is asked for at allocation time. An ordinary `alloc` is a
+    /// plain device allocation and cannot be exported however much a caller
+    /// would like it to be.
+    ///
+    /// **Not for everything.** The virtual-memory granularity is two
+    /// megabytes and every shareable allocation is rounded up to it, so a pool
+    /// of small scratch buffers made this way would waste more than it held.
+    /// This is for the few stable buffers that leave the process -- a worker's
+    /// input and output canvases, a delivered frame -- and `alloc` stays what
+    /// everything else uses.
+    ///
+    /// `kInvalidBuffer` where the backend has no such notion, which is every
+    /// backend but CUDA. A caller that gets one falls back to copying through
+    /// host memory: slower, and not a missing capability.
+    [[nodiscard]] virtual BufferId allocShareable(size_t /*bytes*/) {
+        return kInvalidBuffer;
+    }
+
+    /// An operating-system handle for `id`, or zero.
+    ///
+    /// A file descriptor on POSIX, an NT `HANDLE` on Windows, widened to 64
+    /// bits either way. **The caller owns it and must close it** -- `close`
+    /// there, `CloseHandle` here -- and a fresh one comes back from every call,
+    /// because that is what the driver does and pretending otherwise would leak
+    /// one per frame.
+    ///
+    /// Zero for a buffer that did not come from `allocShareable`. That is the
+    /// honest answer rather than an error: the caller asked whether this buffer
+    /// can cross, and it cannot.
+    ///
+    /// **On Windows the handle alone is not enough.** NT handles are
+    /// per-process, so the child has to be given a duplicate --
+    /// `DuplicateHandle` against its process, or an inheritable handle and
+    /// `bInheritHandles` on the spawn. A file descriptor travels by other
+    /// means again. There is no spelling of this that hides the difference and
+    /// stays truthful, so the caller is told which of the two it is holding by
+    /// the platform it is compiled for.
+    [[nodiscard]] virtual uint64_t exportShareable(BufferId) const { return 0; }
+
+    /// The other end: somebody else's exported allocation, mapped here.
+    ///
+    /// `bytes` is what the exporter asked for, before rounding. The handle
+    /// stays the caller's to close -- this maps what it names and does not take
+    /// it over -- and `release` unmaps without touching the exporter's memory,
+    /// the way `adopt` gives up a claim rather than freeing.
+    [[nodiscard]] virtual BufferId importShareable(uint64_t /*handle*/,
+                                                   size_t /*bytes*/) {
+        return kInvalidBuffer;
+    }
+
     [[nodiscard]] virtual uint64_t devicePointer(BufferId) const { return 0; }
     [[nodiscard]] virtual uint64_t stream() const { return 0; }
 

@@ -25,6 +25,14 @@
 // a small ring of staging buffers so that a dispatch never allocates.
 #include <cuda.h>
 
+#if defined(_WIN32)
+// For the security attributes a Win32 shareable allocation is made with, and
+// nothing else. See `shareableSecurity`.
+#include <windows.h>
+#include <sddl.h>
+#include <winternl.h>
+#endif
+
 #include <atomic>
 #include <cstdio>
 #include <optional>
@@ -42,6 +50,49 @@
 
 namespace gpe {
 namespace {
+
+#if defined(_WIN32)
+/// The object attributes a shareable allocation is created with.
+///
+/// Mandatory, and the type is the trap. The field is called
+/// `win32HandleMetaData` and it wants a **POBJECT_ATTRIBUTES** -- not the
+/// `SECURITY_ATTRIBUTES` that every other Win32 sharing call takes, and not a
+/// null pointer either. Given the wrong struct, or none, `cuMemCreate` reads
+/// the layout it expected and the process goes with an access violation and no
+/// message. Measured here twice before the type was read properly.
+///
+/// The descriptor itself is NVIDIA's own, as an SDDL string: the point of the
+/// allocation is that another process can open it, so it grants the World the
+/// rights a section object is opened with. Built once for the life of the
+/// process -- it describes the class of allocation, not any one of them.
+struct ShareableSecurity {
+    ShareableSecurity() {
+        // D:P(OA;;GARCSDWDWOCCDCLCSWLODTWPRPCRFA;;;WD) -- a protected DACL
+        // granting the World (WD) generic-all and the specific rights a
+        // section object needs. Taken from CUDA's own IPC samples rather than
+        // composed here: the right set is not obvious and getting it wrong
+        // fails at import time in the child, which is a long way from here.
+        static const char kSddl[] = "D:P(OA;;GARCSDWDWOCCDCLCSWLODTWPRPCRFA;;;WD)";
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+                kSddl, SDDL_REVISION_1, &descriptor, nullptr) == 0) {
+            return;
+        }
+        InitializeObjectAttributes(&attributes, nullptr, 0, nullptr, descriptor);
+        good = true;
+    }
+
+    OBJECT_ATTRIBUTES    attributes{};
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    bool                 good = false;
+};
+
+/// One per process. Never destroyed: it outlives every allocation made with it,
+/// and tearing it down at exit would race the driver's own teardown.
+ShareableSecurity& shareableSecurity() {
+    static ShareableSecurity instance;
+    return instance;
+}
+#endif
 
 /// Slang's StructuredBuffer<T>, host side. The layout is the contract with the
 /// generated code and the static_asserts below are what keep it honest.
@@ -258,15 +309,148 @@ public:
         return static_cast<BufferId>(buffers_.size());
     }
 
+    [[nodiscard]] BufferId allocShareable(size_t bytes) override {
+        ensureCurrent();
+        if (bytes == 0) {
+            return kInvalidBuffer;
+        }
+        if (!shareableSupported()) {
+            return kInvalidBuffer;
+        }
+        const CUmemAllocationProp prop = shareableProp();
+#if defined(_WIN32)
+        if (prop.win32HandleMetaData == nullptr) {
+            // Refused rather than attempted: cuMemCreate dereferences this
+            // field and takes the process with it if it is not there.
+            std::fprintf(stderr,
+                         "gpe: no object attributes for a shareable "
+                         "allocation; not making one\n");
+            return kInvalidBuffer;
+        }
+#endif
+        size_t granularity = 0;
+        if (!ok(cuMemGetAllocationGranularity(&granularity, &prop,
+                                              CU_MEM_ALLOC_GRANULARITY_MINIMUM),
+                "cuMemGetAllocationGranularity") ||
+            granularity == 0) {
+            return kInvalidBuffer;
+        }
+        // Up to the granularity, which is two megabytes on every card this
+        // runs on. The caller is told `bytes`; the driver is told the rounded
+        // size, and every call about this allocation afterwards has to use the
+        // rounded one or it fails with an alignment error that names neither.
+        const size_t reserved = ((bytes + granularity - 1) / granularity) * granularity;
+
+        CUmemGenericAllocationHandle memory = 0;
+        if (!ok(cuMemCreate(&memory, reserved, &prop, 0), "cuMemCreate")) {
+            return kInvalidBuffer;
+        }
+        const CUdeviceptr ptr = mapShareable(memory, reserved);
+        if (ptr == 0) {
+            (void)cuMemRelease(memory);
+            return kInvalidBuffer;
+        }
+        Allocation made;
+        made.ptr = ptr;
+        made.bytes = bytes;
+        made.memory = memory;
+        made.reserved = reserved;
+        buffers_.push_back(made);
+        return static_cast<BufferId>(buffers_.size());
+    }
+
+    [[nodiscard]] uint64_t exportShareable(BufferId id) const override {
+        ensureCurrent();
+        const Allocation* a = find(id);
+        if (a == nullptr || a->memory == 0) {
+            return 0;   // an ordinary allocation cannot be exported
+        }
+#if defined(_WIN32)
+        // A fresh HANDLE every time, which is what the driver does. The caller
+        // closes it; this cannot, because it does not know when the child that
+        // was given a duplicate is finished with it.
+        HANDLE handle = nullptr;
+        if (!ok(cuMemExportToShareableHandle(&handle, a->memory,
+                                             CU_MEM_HANDLE_TYPE_WIN32, 0),
+                "cuMemExportToShareableHandle")) {
+            return 0;
+        }
+        return reinterpret_cast<uint64_t>(handle);
+#else
+        int fd = -1;
+        if (!ok(cuMemExportToShareableHandle(
+                    &fd, a->memory, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0),
+                "cuMemExportToShareableHandle")) {
+            return 0;
+        }
+        return static_cast<uint64_t>(fd);
+#endif
+    }
+
+    [[nodiscard]] BufferId importShareable(uint64_t handle, size_t bytes) override {
+        ensureCurrent();
+        if (handle == 0 || bytes == 0) {
+            return kInvalidBuffer;
+        }
+        if (!shareableSupported()) {
+            return kInvalidBuffer;
+        }
+        const CUmemAllocationProp prop = shareableProp();
+        size_t granularity = 0;
+        if (!ok(cuMemGetAllocationGranularity(&granularity, &prop,
+                                              CU_MEM_ALLOC_GRANULARITY_MINIMUM),
+                "cuMemGetAllocationGranularity") ||
+            granularity == 0) {
+            return kInvalidBuffer;
+        }
+        // The same rounding the exporter did. It is not written down anywhere
+        // that crosses, so both ends compute it from the same granularity --
+        // which is a property of the device, and both ends are on this one.
+        const size_t reserved = ((bytes + granularity - 1) / granularity) * granularity;
+
+        CUmemGenericAllocationHandle memory = 0;
+#if defined(_WIN32)
+        void* osHandle = reinterpret_cast<void*>(handle);
+        constexpr CUmemAllocationHandleType kType = CU_MEM_HANDLE_TYPE_WIN32;
+#else
+        void* osHandle = reinterpret_cast<void*>(static_cast<uintptr_t>(handle));
+        constexpr CUmemAllocationHandleType kType =
+            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+#endif
+        if (!ok(cuMemImportFromShareableHandle(&memory, osHandle, kType),
+                "cuMemImportFromShareableHandle")) {
+            return kInvalidBuffer;
+        }
+        const CUdeviceptr ptr = mapShareable(memory, reserved);
+        if (ptr == 0) {
+            (void)cuMemRelease(memory);
+            return kInvalidBuffer;
+        }
+        Allocation made;
+        made.ptr = ptr;
+        made.bytes = bytes;
+        made.memory = memory;
+        made.reserved = reserved;
+        made.imported = true;
+        buffers_.push_back(made);
+        return static_cast<BufferId>(buffers_.size());
+    }
+
     void release(BufferId id) override {
         ensureCurrent();
         if (Allocation* a = find(id); a != nullptr && a->ptr != 0) {
-            if (!a->borrowed) {
+            if (a->memory != 0) {
+                // The three objects a shareable allocation is, in the order
+                // that leaves nothing behind: the mapping, then the allocation
+                // -- unless it is somebody else's, in which case only their
+                // reference goes -- then the address range.
+                (void)cuMemUnmap(a->ptr, a->reserved);
+                (void)cuMemRelease(a->memory);
+                (void)cuMemAddressFree(a->ptr, a->reserved);
+            } else if (!a->borrowed) {
                 cuMemFree(a->ptr);
             }
-            a->ptr = 0;
-            a->bytes = 0;
-            a->borrowed = false;
+            *a = Allocation{};
         }
     }
 
@@ -735,6 +919,19 @@ private:
         /// and never freed here: freeing it would take a frame out from under
         /// the decoder that is still recycling it.
         bool        borrowed = false;
+        /// The virtual-memory allocation behind a shareable buffer, and the
+        /// size it was rounded up to. Zero for an ordinary `cuMemAlloc`, which
+        /// is freed with `cuMemFree` and knows nothing about any of this.
+        ///
+        /// Three objects, not one, and releasing takes all three in order:
+        /// the mapping, then the allocation, then the address range. Skipping
+        /// the last leaks address space rather than memory, which is the kind
+        /// of leak a long-running render host notices a day later.
+        CUmemGenericAllocationHandle memory = 0;
+        size_t                       reserved = 0;
+        /// Mapped from somebody else's export. Unmapped here, never released:
+        /// the allocation belongs to the process that made it.
+        bool                         imported = false;
     };
     struct HostBlock {
         void*  memory = nullptr;
@@ -858,6 +1055,91 @@ private:
         auto* self = static_cast<CudaDevice*>(userData);
         self->reportCompleted(
             self->finished_.fetch_add(1, std::memory_order_relaxed) + 1);
+    }
+
+    /// Whether this card can do any of this, asked once.
+    ///
+    /// Asked rather than attempted, because the failure mode is not an error
+    /// code. `cuMemCreate` on a device without virtual-memory management, or
+    /// with a handle type it does not support, is not documented to return
+    /// anything in particular, and the one thing measured here is that it can
+    /// take the process with it. A capability question has an answer; asking
+    /// it is cheaper than finding out.
+    [[nodiscard]] bool shareableSupported() const {
+        static const int supported = [this] {
+            int vmm = 0;
+            (void)cuDeviceGetAttribute(
+                &vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
+                device_);
+            int handle = 0;
+            (void)cuDeviceGetAttribute(
+                &handle,
+#if defined(_WIN32)
+                CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_WIN32_HANDLE_SUPPORTED,
+#else
+                CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED,
+#endif
+                device_);
+            if (vmm == 0 || handle == 0) {
+                std::fprintf(stderr,
+                             "gpe: this device shares no allocations "
+                             "(virtual memory %d, handle type %d)\n",
+                             vmm, handle);
+            }
+            return vmm != 0 && handle != 0 ? 1 : 0;
+        }();
+        return supported != 0;
+    }
+
+    /// What a shareable allocation on this device is made of.
+    ///
+    /// One function because both ends need the identical description: the
+    /// granularity the exporter rounds to is computed from it, and so is the
+    /// one the importer rounds to.
+    [[nodiscard]] CUmemAllocationProp shareableProp() const {
+        CUmemAllocationProp prop{};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = device_;
+#if defined(_WIN32)
+        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_WIN32;
+        // Mandatory. See ShareableSecurity for what happens without it.
+        if (ShareableSecurity& security = shareableSecurity(); security.good) {
+            prop.win32HandleMetaData = &security.attributes;
+        }
+#else
+        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+#endif
+        return prop;
+    }
+
+    /// Address space for `memory`, mapped and made readable and writable.
+    ///
+    /// The half that is the same whether the allocation was made here or
+    /// imported from elsewhere. Zero on failure, with everything it did
+    /// undone: a reservation left behind on a failed map is address space
+    /// nobody can name and nobody will free.
+    [[nodiscard]] CUdeviceptr mapShareable(CUmemGenericAllocationHandle memory,
+                                           size_t reserved) const {
+        CUdeviceptr ptr = 0;
+        if (!ok(cuMemAddressReserve(&ptr, reserved, 0, 0, 0),
+                "cuMemAddressReserve")) {
+            return 0;
+        }
+        if (!ok(cuMemMap(ptr, reserved, 0, memory, 0), "cuMemMap")) {
+            (void)cuMemAddressFree(ptr, reserved);
+            return 0;
+        }
+        CUmemAccessDesc access{};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = device_;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        if (!ok(cuMemSetAccess(ptr, reserved, &access, 1), "cuMemSetAccess")) {
+            (void)cuMemUnmap(ptr, reserved);
+            (void)cuMemAddressFree(ptr, reserved);
+            return 0;
+        }
+        return ptr;
     }
 
     [[nodiscard]] Allocation* find(BufferId id) {

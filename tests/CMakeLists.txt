@@ -54,6 +54,10 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_roundtrip.cpp" AND
    NOT GPE_BACKEND STREQUAL "none")
     gpe_test(test_roundtrip)
 endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_shareable.cpp" AND
+   NOT GPE_BACKEND STREQUAL "none")
+    gpe_test(test_shareable)
+endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_realtime.cpp" AND
    NOT GPE_BACKEND STREQUAL "none")
     gpe_test(test_realtime)

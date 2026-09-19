@@ -201,6 +201,11 @@ if(GPE_SOURCES)
         # <<<>>> launch needs the kernel compiled into this binary by nvcc,
         # which is the thing embedding a blob is instead of.
         target_link_libraries(gpe PRIVATE CUDA::cuda_driver)
+        if(WIN32)
+            # For the security descriptor a shareable allocation is created
+            # with: InitializeSecurityDescriptor and SetEntriesInAcl live here.
+            target_link_libraries(gpe PRIVATE advapi32)
+        endif()
         target_include_directories(gpe PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     endif()
 else()
