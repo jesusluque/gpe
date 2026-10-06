@@ -58,6 +58,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -254,6 +255,25 @@ public:
     /// `sync()` after a bounded spin, which is correct and blunt. A backend
     /// that wants the sharp version calls notifyCompleted from its handler.
     void waitFor(Submission at);
+
+    /// Waits for `retired(at)` without the pool's lock and without a driver
+    /// call, so any thread may wait while the thread that dispatches goes on
+    /// dispatching. True once it has retired; false if `limit` passed first.
+    ///
+    /// What `waitFor` does not give: it holds the lock while it spins and
+    /// syncs, and it is called on the thread that queues the work, so that
+    /// thread queued nothing else until the device had finished. A host
+    /// that wants the next job's CPU half to overlap this job's GPU half
+    /// waits here, on another thread, after the dispatching thread has
+    /// called `flush()` -- a submission still sitting in a backend's batch
+    /// is never reported, and this would wait the whole `limit` for it.
+    ///
+    /// No `sync()` fallback, deliberately: that is a device-wide call under
+    /// the lock, and the caller decides where to make it. A false answer
+    /// means a backend that publishes nothing, a dispatch the backend
+    /// refused after it was counted, or a device that really is that busy;
+    /// `waitFor` on the dispatching thread settles all three.
+    [[nodiscard]] bool waitRetired(Submission at, std::chrono::microseconds limit);
 
     /// The device underneath, for the optional interfaces a backend may
     /// implement -- completion reporting, host staging. Not for allocating

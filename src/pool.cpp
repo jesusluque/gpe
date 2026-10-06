@@ -478,6 +478,42 @@ void PooledDevice::waitFor(Submission at) {
     sync();
 }
 
+bool PooledDevice::waitRetired(Submission at, std::chrono::microseconds limit) {
+    using Clock = std::chrono::steady_clock;
+    // Everything read here is atomic or fixed at construction: the reporter's
+    // counter, this pool's watermark, and the pointer to the reporter.
+    const auto settle = [this, at] {
+        if (reporter_ != nullptr) {
+            notifyCompleted(reporter_->completedSubmissions());
+        }
+        return retired(at);
+    };
+    if (settle()) {
+        return true;
+    }
+    // Spin briefly -- a kernel of a few hundred microseconds is the common
+    // case, and a sleep's granularity would cost more than the kernel -- then
+    // back off to short sleeps so a long wait does not burn a core.
+    const Clock::time_point start = Clock::now();
+    const Clock::time_point deadline = start + limit;
+    auto pause = std::chrono::microseconds(20);
+    for (;;) {
+        if (settle()) {
+            return true;
+        }
+        const Clock::time_point now = Clock::now();
+        if (now >= deadline) {
+            return false;
+        }
+        if (now - start < std::chrono::microseconds(200)) {
+            std::this_thread::yield();
+            continue;
+        }
+        std::this_thread::sleep_for(pause);
+        pause = std::min(pause * 2, std::chrono::microseconds(250));
+    }
+}
+
 void* PooledDevice::allocShared(size_t bytes, BufferId& out) {
     const std::lock_guard<std::recursive_mutex> held(guard_);
     out = kInvalidBuffer;
