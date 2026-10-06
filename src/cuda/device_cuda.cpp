@@ -501,6 +501,11 @@ public:
             return false;
         }
         noteCompute(lane);
+        // Counted and reported like a dispatch, because the pool counts it:
+        // a lane reading this buffer next waits for the clear by number.
+        ++lane.submitted;
+        (void)ok(cuLaunchHostFunc(lane.stream, &CudaDevice::onCompleted, &lane),
+                 "cuLaunchHostFunc(fill)");
         return true;
     }
 
@@ -856,7 +861,7 @@ private:
         /// An upload this lane's next work must wait for.
         bool        uploadPending = false;
         /// This lane's own count, matching the pool's for the lane because
-        /// both increment once per dispatch on it and nothing else does.
+        /// both increment once per dispatch or fill on it and nothing else does.
         uint64_t              submitted = 0;
         std::atomic<uint64_t> finished{0};
         /// By KernelId - 1; empty entries not loaded on this lane yet.

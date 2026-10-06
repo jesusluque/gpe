@@ -464,11 +464,15 @@ bool PooledDevice::fill(BufferId id, uint8_t byte, size_t bytes) {
     }
     const LaneId lane = laneHere();
     settleAcrossLanes(*slot, lane);
-    // A fill is queued on the lane like a dispatch and ordered with its work,
-    // though it is not counted as a submission: the next dispatch on this
-    // lane is what marks the buffer's use.
+    if (!native_->fill(slot->native, byte, bytes)) {
+        return false;
+    }
+    // Counted like a dispatch, and the backends report it like one: a buffer
+    // cleared on one lane and written on another must wait for the clear, and
+    // it can only wait for a number that will be reported.
     noteUse(*slot, lane);
-    return native_->fill(slot->native, byte, bytes);
+    ++submitted_[lane];
+    return true;
 }
 
 KernelId PooledDevice::load(std::string_view name) { return native_->load(name); }

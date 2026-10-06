@@ -426,6 +426,14 @@ public:
         blit->fillBuffer(*slot, NS::Range::Make(0, bytes), byte);
         blit->endEncoding();
         noteCompute(lane, commands);
+        // A submission of its own, numbered and reported like a batch: the
+        // pool counts it, so a lane that reads this buffer next can wait for
+        // the clear by number.
+        const uint64_t submission = ++lane.submitted;
+        const LaneId   index = static_cast<LaneId>(&lane - lanes_);
+        commands->addCompletedHandler(^(MTL::CommandBuffer*) {
+            reportCompleted(submission, 0.0, index);
+        });
         commands->commit();
         // Kept as the last thing on the lane's queue, so `sync()` waits for
         // it like it waits for a dispatch.
@@ -727,7 +735,8 @@ private:
         uint32_t                    batched = 0;
         uint64_t                    batchLast = 0;
         /// This lane's own count, which matches the pool's for the lane
-        /// because both increment once per dispatch on it and nothing else.
+        /// because both increment once per dispatch or fill on it and
+        /// nothing else.
         uint64_t submitted = 0;
         /// The last command buffer committed here, for sync to wait on.
         MTL::CommandBuffer* previous = nullptr;
