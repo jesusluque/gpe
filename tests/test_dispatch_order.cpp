@@ -5,13 +5,11 @@
 // buffer), and true of every backend: a later dispatch wins over an earlier
 // one, an upload issued after a dispatch lands after it, a fill after it too,
 // a download sees all of it, and `waitFor` on a queued submission returns
-// once that work has run rather than after a spin and a full sync --
-// `waitRetired` the same from another thread, without the lock. Also
+// once that work has run rather than after a spin and a full sync. Also
 // prints what a small dispatch costs, which is what batching is for.
 #include <chrono>
 #include <cstdio>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "gpe/args.h"
@@ -96,25 +94,6 @@ int main() {
     const double waited = msSince(waitStart);
     check(device.retired(at), "waitFor returns with the submission retired");
     std::printf("test_dispatch_order: waitFor on a queued dispatch took %.2f ms\n", waited);
-
-    // waitRetired from another thread, once the dispatching thread has
-    // flushed: true, without the lock -- the dispatching thread keeps going.
-    run(15);
-    const Submission later = device.submission();
-    device.flush();
-    bool fromElsewhere = false;
-    std::thread waiter([&] {
-        fromElsewhere = device.waitRetired(later, std::chrono::seconds(5));
-    });
-    run(17);   // dispatched while the other thread waits
-    waiter.join();
-    check(fromElsewhere, "waitRetired on another thread sees a flushed submission retire");
-    // And false, promptly, for a submission nobody will ever queue.
-    device.sync();
-    const auto never = Clock::now();
-    check(!device.waitRetired(device.submission() + 3, std::chrono::milliseconds(20)),
-          "waitRetired gives up on a submission that never comes");
-    check(msSince(never) < 500.0, "waitRetired gives up near its limit");
 
     // What a small dispatch costs, counted over many.
     constexpr int kDispatches = 2000;

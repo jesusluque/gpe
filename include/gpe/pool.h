@@ -58,7 +58,6 @@
 #pragma once
 
 #include <atomic>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -71,7 +70,6 @@
 
 #include "gpe/completion.h"
 #include "gpe/device.h"
-#include "gpe/lane.h"
 
 namespace gpe {
 
@@ -223,57 +221,24 @@ public:
     /// queued. That wait is untimed on purpose, so backwards was fatal rather
     /// than slow: the symptom is a player that hangs when it stops, because a
     /// refused dispatch is most likely to be the last thing a slot saw.
-    void notifyCompleted(Submission done) noexcept { notifyCompleted(0, done); }
-
-    /// The same, for one lane.
-    void notifyCompleted(LaneId lane, Submission done) noexcept {
-        if (lane >= kMaxLanes) {
-            return;
-        }
-        std::atomic<Submission>& mark = completed_[lane];
-        Submission seen = mark.load(std::memory_order_relaxed);
+    void notifyCompleted(Submission done) noexcept {
+        Submission seen = completed_.load(std::memory_order_relaxed);
         while (done > seen &&
-               !mark.compare_exchange_weak(seen, done, std::memory_order_release,
-                                           std::memory_order_relaxed)) {
+               !completed_.compare_exchange_weak(seen, done,
+                                                 std::memory_order_release,
+                                                 std::memory_order_relaxed)) {
         }
     }
 
-    // --- lanes (gpe/lane.h) ------------------------------------------------
+    /// The submission a dispatch queued now would belong to.
+    [[nodiscard]] Submission submission() const noexcept { return submitted_; }
 
-    /// Opens `count` lanes on a backend that has them, and answers how many
-    /// there are -- one on a backend without. Prepare-time, before the lanes
-    /// it adds are used.
-    uint32_t openLanes(uint32_t count);
-    [[nodiscard]] uint32_t lanes() const noexcept {
-        return lanes_.load(std::memory_order_acquire);
-    }
-
-    /// The calling thread's lane, clamped to the lanes that exist.
-    [[nodiscard]] LaneId laneHere() const noexcept;
-
-    /// Where the calling thread's lane has got to: wait on this, from any
-    /// thread, to know its work so far has finished.
-    [[nodiscard]] Fence fence() const noexcept {
-        const LaneId lane = laneHere();
-        return Fence{lane, submitted_[lane]};
-    }
-
-    /// The submission a dispatch queued now would belong to, on the calling
-    /// thread's lane.
-    [[nodiscard]] Submission submission() const noexcept {
-        return submitted_[laneHere()];
-    }
-
-    /// Has everything up to `at` finished, on the calling thread's lane?
+    /// Has everything up to `at` finished?
     ///
     /// A read of the watermark and nothing else -- no driver call, so it is
     /// safe to ask inside a frame and cheap enough to ask every frame.
     [[nodiscard]] bool retired(Submission at) const noexcept {
-        return retired(Fence{laneHere(), at});
-    }
-    [[nodiscard]] bool retired(Fence fence) const noexcept {
-        return fence.lane < kMaxLanes &&
-               completed_[fence.lane].load(std::memory_order_acquire) >= fence.value;
+        return completed_.load(std::memory_order_acquire) >= at;
     }
 
     /// Blocks until `retired(at)`.
@@ -288,32 +253,7 @@ public:
     /// exactly per-slot; and if a backend publishes nothing it falls back to
     /// `sync()` after a bounded spin, which is correct and blunt. A backend
     /// that wants the sharp version calls notifyCompleted from its handler.
-    void waitFor(Submission at) { waitFor(Fence{laneHere(), at}); }
-    void waitFor(Fence fence);
-
-    /// Waits for `retired(at)` without the pool's lock and without a driver
-    /// call, so any thread may wait while the thread that dispatches goes on
-    /// dispatching. True once it has retired; false if `limit` passed first.
-    ///
-    /// What `waitFor` does not give: it holds the lock while it spins and
-    /// syncs, and it is called on the thread that queues the work, so that
-    /// thread queued nothing else until the device had finished. A host
-    /// that wants the next job's CPU half to overlap this job's GPU half
-    /// waits here, on another thread, after the dispatching thread has
-    /// called `flush()` -- a submission still sitting in a backend's batch
-    /// is never reported, and this would wait the whole `limit` for it.
-    ///
-    /// No `sync()` fallback, deliberately: that is a device-wide call under
-    /// the lock, and the caller decides where to make it. A false answer
-    /// means a backend that publishes nothing, a dispatch the backend
-    /// refused after it was counted, or a device that really is that busy;
-    /// `waitFor` on the dispatching thread settles all three.
-    [[nodiscard]] bool waitRetired(Submission at, std::chrono::microseconds limit) {
-        return waitRetired(Fence{laneHere(), at}, limit);
-    }
-    /// The same for a fence taken on any lane -- which is what a thread other
-    /// than the one that queued the work holds.
-    [[nodiscard]] bool waitRetired(Fence fence, std::chrono::microseconds limit);
+    void waitFor(Submission at);
 
     /// The device underneath, for the optional interfaces a backend may
     /// implement -- completion reporting, host staging. Not for allocating
@@ -343,11 +283,6 @@ private:
 
     struct Slot {
         BufferId native = kInvalidBuffer;
-        /// The lane that last queued work using this buffer, and that work's
-        /// number there. A different lane using it before that work retires
-        /// waits for it first. See gpe/lane.h.
-        LaneId     lastLane = 0;
-        Submission lastUse = 0;
         size_t   bucketBytes = 0;
         /// What was asked for, which is what the bucket was rounded up from.
         size_t   askedBytes = 0;
@@ -359,12 +294,9 @@ private:
         bool     borrowed = false;
     };
 
-    /// Every lane's count when the buffer was released: it is free again once
-    /// each lane has finished that much. Released in order, so the marks only
-    /// grow along the queue and the front is always the first to come free.
     struct Retiring {
         uint32_t   slot = 0;
-        Submission at[kMaxLanes]{};
+        Submission at = 0;
     };
 
     [[nodiscard]] static int bucketFor(size_t bytes) noexcept;
@@ -383,17 +315,6 @@ private:
     /// travelling somewhere it does not mean anything.
     void checkThread(const char* where) const;
 
-    /// Waits, with the lock held, for whatever another lane still has queued
-    /// against this buffer. See gpe/lane.h; a stall, and the fallback.
-    void settleAcrossLanes(Slot& slot, LaneId lane);
-    /// Marks this lane's next submission as the buffer's last use.
-    void noteUse(Slot& slot, LaneId lane) noexcept {
-        slot.lastLane = lane;
-        slot.lastUse = submitted_[lane] + 1;
-    }
-    /// Reads the reporter's marks into this pool's. Lock-free.
-    void absorbReported() noexcept;
-
     std::unique_ptr<Device>     native_;
     size_t                      budget_ = 0;
     std::function<bool(size_t)> onPressure_;
@@ -401,10 +322,6 @@ private:
     /// with a dynamic_cast in the constructor; null for a backend that does
     /// not, which then falls back to sync().
     const CompletionReporting*  reporter_ = nullptr;
-    /// The native device's lanes, if it has them. Same dynamic_cast, same
-    /// fallback: one lane.
-    LaneBackend*                laneBackend_ = nullptr;
-    std::atomic<uint32_t>       lanes_{1};
 
     std::vector<Slot>                  slots_;
     std::vector<std::vector<uint32_t>> freeByBucket_;
@@ -414,11 +331,10 @@ private:
     /// A member rather than a local: the backend may copy it asynchronously.
     std::vector<unsigned char>         translated_;
 
-    /// Per lane. Written under the lock by the thread dispatching on that
-    /// lane, read by it too; the completion threads only ever write
-    /// `completed_`.
-    Submission              submitted_[kMaxLanes]{};
-    std::atomic<Submission> completed_[kMaxLanes]{};
+    /// Written by the render thread, read by it too. The completion thread only
+    /// ever writes `completed_`.
+    Submission              submitted_ = 0;
+    std::atomic<Submission> completed_{0};
 
     Stats stats_{};
 
@@ -433,7 +349,7 @@ private:
 
     /// The thread that first used this pool, and whether it has been told about
     /// a second one. Mutable because the check belongs in const methods too.
-    mutable std::thread::id owner_[kMaxLanes]{};
+    mutable std::thread::id owner_{};
     mutable bool            complainedAboutThread_ = false;
 };
 

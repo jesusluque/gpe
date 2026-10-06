@@ -38,7 +38,6 @@
 #include "gpe/adopt.h"
 #include "gpe/args.h"
 #include "gpe/device.h"
-#include "gpe/lane.h"
 #include "kernel_registry.h"
 
 namespace gpe {
@@ -65,30 +64,11 @@ bool ok(CUresult result, const char* what) {
 
 class CudaDevice final : public Device,
                         public CompletionReporting,
-                        public HostStaging,
-                        public LaneBackend {
-    /// Defined with the other private types below; named here because
-    /// methods above that take one come first.
-    struct Lane;
-
+                        public HostStaging {
 public:
     ~CudaDevice() override {
         if (context_ != nullptr) {
             cuCtxSetCurrent(context_);
-            for (uint32_t i = 0; i < laneCount_; ++i) {
-                Lane& lane = lanes_[i];
-                if (lane.computeDone != nullptr) {
-                    cuEventDestroy(lane.computeDone);
-                }
-                for (const CUmodule module : lane.modules) {
-                    cuModuleUnload(module);
-                }
-                // Lane 0's stream is the one this device always had, and it
-                // was never destroyed here; the lanes it made, it destroys.
-                if (i > 0 && lane.stream != nullptr) {
-                    cuStreamDestroy(lane.stream);
-                }
-            }
             for (const CUdeviceptr staging : staging_) {
                 cuMemFree(staging);
             }
@@ -111,6 +91,9 @@ public:
             if (copyDone_ != nullptr) {
                 cuEventDestroy(copyDone_);
             }
+            if (computeDone_ != nullptr) {
+                cuEventDestroy(computeDone_);
+            }
             for (const Timing& timing : timings_) {
                 if (timing.start != nullptr) {
                     cuEventDestroy(timing.start);
@@ -118,6 +101,9 @@ public:
                 if (timing.stop != nullptr) {
                     cuEventDestroy(timing.stop);
                 }
+            }
+            for (const CUmodule module : modules_) {
+                cuModuleUnload(module);
             }
             if (!adoptedContext_) {
                 cuDevicePrimaryCtxRelease(device_);
@@ -159,12 +145,9 @@ public:
         // Unless one is handed over: the renderer's stream, so that its work
         // and gpe's are ordered by the stream itself, exactly as openFXplayer
         // orders TensorRT behind gpe's kernels.
-        Lane& first = lanes_[0];
-        first.owner = this;
-        first.index = 0;
         if (stream != nullptr) {
-            first.stream = stream;
-        } else if (!ok(cuStreamCreate(&first.stream, CU_STREAM_NON_BLOCKING), "streamCreate")) {
+            stream_ = stream;
+        } else if (!ok(cuStreamCreate(&stream_, CU_STREAM_NON_BLOCKING), "streamCreate")) {
             return false;
         }
         // A second stream for transfers.
@@ -194,7 +177,7 @@ public:
                 "copyStreamCreate") ||
             !ok(cuEventCreate(&copyDone_, CU_EVENT_DISABLE_TIMING),
                 "copyEventCreate") ||
-            !ok(cuEventCreate(&first.computeDone, CU_EVENT_DISABLE_TIMING),
+            !ok(cuEventCreate(&computeDone_, CU_EVENT_DISABLE_TIMING),
                 "computeEventCreate")) {
             return false;
         }
@@ -243,40 +226,6 @@ public:
     }
 
     [[nodiscard]] Backend backend() const override { return Backend::CUDA; }
-
-    // --- LaneBackend -------------------------------------------------------
-    //
-    // A lane is a stream of its own -- and a copy of every module it runs.
-    //
-    // The copy is the part that matters. Slang puts a kernel's buffers and
-    // its uniform pointer in one __constant__ block per module, and a launch
-    // reads that block when it runs, not when it is queued: two streams
-    // launching the same kernel with different arguments would each write
-    // the block and both launches would read whichever write landed last.
-    // One module per lane gives each lane a block of its own, without
-    // touching a kernel or the way they are written. Loaded on a lane's
-    // first use of the kernel, so a lane pays only for what it runs.
-
-    uint32_t openLanes(uint32_t count) override {
-        ensureCurrent();
-        count = std::min(std::max(count, 1u), kMaxLanes);
-        for (uint32_t i = laneCount_; i < count; ++i) {
-            Lane& lane = lanes_[i];
-            lane.owner = this;
-            lane.index = i;
-            if (!ok(cuStreamCreate(&lane.stream, CU_STREAM_NON_BLOCKING), "laneStreamCreate") ||
-                !ok(cuEventCreate(&lane.computeDone, CU_EVENT_DISABLE_TIMING),
-                    "laneEventCreate")) {
-                count = i;
-                break;
-            }
-        }
-        laneCount_ = std::max(laneCount_, count);
-        return laneCount_;
-    }
-
-    /// Nothing held back: a launch goes to its stream when it is made.
-    void flushLane(LaneId) override {}
 
     /// The CUDA context is a per-thread notion and this device is not: images
     /// are allocated on render threads and pictures prepared on the painting
@@ -355,7 +304,7 @@ public:
             if (ok(cuMemcpyHtoDAsync(a->ptr, src, bytes, copyStream_),
                    "upload HtoDAsync(direct)")) {
                 (void)ok(cuEventRecord(copyDone_, copyStream_), "copyEventRecord");
-                uploadsPending();
+                uploadPending_ = true;
             }
             return;
         }
@@ -386,7 +335,7 @@ public:
             (void)ok(cuEventRecord(lastUploadSlot_->done, copyStream_),
                      "uploadSlotRecord");
         }
-        uploadsPending();
+        uploadPending_ = true;
     }
 
     void download(void* dst, BufferId id, size_t bytes) override {
@@ -410,22 +359,21 @@ public:
         //
         // Enqueued on the compute stream, not issued as a plain cuMemcpyDtoH.
         // The plain call synchronises with the *legacy default* stream, and
-        // each lane's stream is CU_STREAM_NON_BLOCKING -- so the copy engine overtook a
+        // stream_ is CU_STREAM_NON_BLOCKING -- so the copy engine overtook a
         // kernel still writing the buffer and handed back the frame from
         // before it. The display test caught it: the 33-cube LUT won that
         // race every run and the 65-cube lost it every run, which read as a
         // size-dependent sampling bug and was nothing of the kind.
-        Lane& lane = here();
-        if (lane.uploadPending) {
+        if (uploadPending_) {
             // A download straight after an upload, with no dispatch between:
             // order it behind the copy stream's work too, as dispatch would.
-            (void)ok(cuStreamWaitEvent(lane.stream, copyDone_, 0), "streamWaitEvent");
-            lane.uploadPending = false;
+            (void)ok(cuStreamWaitEvent(stream_, copyDone_, 0), "streamWaitEvent");
+            uploadPending_ = false;
         }
-        if (!ok(cuMemcpyDtoHAsync(dst, a->ptr, bytes, lane.stream), "DtoHAsync")) {
+        if (!ok(cuMemcpyDtoHAsync(dst, a->ptr, bytes, stream_), "DtoHAsync")) {
             return;
         }
-        (void)ok(cuStreamSynchronize(lane.stream), "downloadSync");
+        (void)ok(cuStreamSynchronize(stream_), "downloadSync");
     }
 
     [[nodiscard]] uint64_t devicePointer(BufferId id) const override {
@@ -433,10 +381,8 @@ public:
         return a != nullptr ? static_cast<uint64_t>(a->ptr) : 0;
     }
 
-    /// The calling thread's lane's stream: an inference runtime enqueuing
-    /// there lands behind this lane's kernels and ahead of its next ones.
     [[nodiscard]] uint64_t stream() const override {
-        return reinterpret_cast<uint64_t>(const_cast<CudaDevice*>(this)->here().stream);
+        return reinterpret_cast<uint64_t>(stream_);
     }
 
     [[nodiscard]] uint64_t backendBuffer(BufferId id) const override {
@@ -460,31 +406,22 @@ public:
         }
     }
 
-    /// Remembers that a lane's stream has work an upload must not overtake.
-    void noteCompute(Lane& lane) noexcept {
-        if (lane.computeDone != nullptr &&
-            ok(cuEventRecord(lane.computeDone, lane.stream), "computeEventRecord")) {
-            lane.computePending = true;
+    /// Remembers that the compute stream has work an upload must not overtake.
+    void noteCompute() noexcept {
+        if (computeDone_ != nullptr &&
+            ok(cuEventRecord(computeDone_, stream_), "computeEventRecord")) {
+            computePending_ = true;
         }
     }
 
-    /// Orders `into` behind every lane's work, once. Cheap when there is none:
-    /// the whole point is to keep the overlap everywhere it is safe to have.
+    /// Orders `into` behind that work, once. Cheap when there is none: the
+    /// whole point is to keep the overlap everywhere it is safe to have.
     void awaitCompute(CUstream into) noexcept {
-        for (uint32_t i = 0; i < laneCount_; ++i) {
-            Lane& lane = lanes_[i];
-            if (lane.computePending) {
-                (void)ok(cuStreamWaitEvent(into, lane.computeDone, 0), "computeWaitEvent");
-                lane.computePending = false;
-            }
+        if (!computePending_) {
+            return;
         }
-    }
-
-    /// Every lane has an upload to wait for before its next work.
-    void uploadsPending() noexcept {
-        for (uint32_t i = 0; i < laneCount_; ++i) {
-            lanes_[i].uploadPending = true;
-        }
+        (void)ok(cuStreamWaitEvent(into, computeDone_, 0), "computeWaitEvent");
+        computePending_ = false;
     }
 
     [[nodiscard]] bool fill(BufferId id, uint8_t byte, size_t bytes) override {
@@ -496,16 +433,10 @@ public:
         // On the compute stream, for the same reason `download` is: a memset
         // that raced ahead of a kernel still writing the buffer would clear the
         // picture it had just made, and only sometimes.
-        Lane& lane = here();
-        if (!ok(cuMemsetD8Async(a->ptr, byte, bytes, lane.stream), "memsetD8Async")) {
+        if (!ok(cuMemsetD8Async(a->ptr, byte, bytes, stream_), "memsetD8Async")) {
             return false;
         }
-        noteCompute(lane);
-        // Counted and reported like a dispatch, because the pool counts it:
-        // a lane reading this buffer next waits for the clear by number.
-        ++lane.submitted;
-        (void)ok(cuLaunchHostFunc(lane.stream, &CudaDevice::onCompleted, &lane),
-                 "cuLaunchHostFunc(fill)");
+        noteCompute();
         return true;
     }
 
@@ -526,21 +457,33 @@ public:
                          static_cast<int>(name.size()), name.data());
             return kInvalidKernel;
         }
-        Kernel kernel;
-        kernel.name = std::string(name);
-        kernel.blob = &resolved->blob;
-        kernel.info = resolved->info;
-        // Lane 0's module now, so a kernel that will not load fails here, at
-        // load, as it always did. The other lanes load theirs on first use.
-        LaneKernel first;
-        if (!loadModule(kernel, first)) {
+        const kernels::Blob* blob = &resolved->blob;
+        CUmodule module = nullptr;
+        // The PTX is text and the blob is not terminated, so it is copied into
+        // a string first. Once per kernel, ever.
+        const std::string ptx(reinterpret_cast<const char*>(blob->data),
+                              blob->size);
+        if (!ok(cuModuleLoadData(&module, ptx.c_str()), "cuModuleLoadData")) {
             return kInvalidKernel;
         }
-        kernel.globalsBytes = first.globalsBytes;
-        kernels_.push_back(std::move(kernel));
-        lanes_[0].kernels.resize(kernels_.size());
-        lanes_[0].kernels.back() = first;
-        lanes_[0].modules.push_back(first.module);
+        CUfunction function = nullptr;
+        const std::string entry(blob->entry);
+        if (!ok(cuModuleGetFunction(&function, module, entry.c_str()),
+                "cuModuleGetFunction")) {
+            cuModuleUnload(module);
+            return kInvalidKernel;
+        }
+        CUdeviceptr globals = 0;
+        size_t globalsBytes = 0;
+        if (!ok(cuModuleGetGlobal(&globals, &globalsBytes, module,
+                                  "SLANG_globalParams"),
+                "cuModuleGetGlobal")) {
+            cuModuleUnload(module);
+            return kInvalidKernel;
+        }
+        modules_.push_back(module);
+        kernels_.push_back(Kernel{std::string(name), function, globals,
+                                  globalsBytes, resolved->info});
         return static_cast<KernelId>(kernels_.size());
     }
 
@@ -551,11 +494,6 @@ public:
             return;
         }
         const Kernel& kernel = kernels_[id - 1];
-        Lane& lane = here();
-        const LaneKernel* mine = kernelOn(lane, id);
-        if (mine == nullptr) {
-            return;
-        }
         const Args::View view = Args::read(args, bytes);
         if (!view.valid) {
             std::fprintf(stderr, "gpe/cuda: malformed dispatch args\n");
@@ -599,11 +537,11 @@ public:
             (void)ok(cuEventSynchronize(stagingDone_[slot]), "stagingWait");
             std::memcpy(pinned_[slot], view.uniforms, view.uniformBytes);
             if (!ok(cuMemcpyHtoDAsync(uniforms, pinned_[slot], view.uniformBytes,
-                                      lane.stream),
+                                      stream_),
                     "uniforms HtoDAsync")) {
                 return;
             }
-            (void)ok(cuEventRecord(stagingDone_[slot], lane.stream),
+            (void)ok(cuEventRecord(stagingDone_[slot], stream_),
                      "stagingRecord");
         }
 
@@ -671,13 +609,12 @@ public:
         stagingAt_ = (stagingAt_ + 1) % kStagingSlots;
         (void)ok(cuEventSynchronize(stagingDone_[slot]), "stagingWait");
         std::memcpy(pinned_[slot], globals.data(), globals.size());
-        // Into this lane's copy of the module's block. See openLanes.
-        if (!ok(cuMemcpyHtoDAsync(mine->globals, pinned_[slot], globals.size(),
-                                  lane.stream),
+        if (!ok(cuMemcpyHtoDAsync(kernel.globals, pinned_[slot], globals.size(),
+                                  stream_),
                 "globals HtoDAsync")) {
             return;
         }
-        (void)ok(cuEventRecord(stagingDone_[slot], lane.stream), "stagingRecord");
+        (void)ok(cuEventRecord(stagingDone_[slot], stream_), "stagingRecord");
 
         // Threads to groups. The client asks in threads because that is the
         // number both backends agree about; the rounding up is why every kernel
@@ -713,21 +650,21 @@ public:
         // for nothing else. Without this the kernel could read a buffer whose
         // DMA is still running; with a full synchronisation instead, there
         // would be no overlap left to have.
-        if (lane.uploadPending) {
-            (void)ok(cuStreamWaitEvent(lane.stream, copyDone_, 0), "streamWaitEvent");
-            lane.uploadPending = false;
+        if (uploadPending_) {
+            (void)ok(cuStreamWaitEvent(stream_, copyDone_, 0), "streamWaitEvent");
+            uploadPending_ = false;
         }
 
-        (void)cuEventRecord(timings_[timingAt_].start, lane.stream);
+        (void)cuEventRecord(timings_[timingAt_].start, stream_);
 
         // No kernel parameters at all: Slang puts everything in the
         // __constant__ block, so the launch passes nothing.
-        (void)ok(cuLaunchKernel(mine->function, groups(grid.x, blockX),
+        (void)ok(cuLaunchKernel(kernel.function, groups(grid.x, blockX),
                                 groups(grid.y, blockY), groups(grid.z, blockZ),
-                                blockX, blockY, blockZ, 0, lane.stream, nullptr,
+                                blockX, blockY, blockZ, 0, stream_, nullptr,
                                 nullptr),
                  "cuLaunchKernel");
-        noteCompute(lane);
+        noteCompute();
 
         // Bracketed by events, so the device times itself.
         //
@@ -741,19 +678,19 @@ public:
         if (timing.pending) {
             timing.pending = false;   // dropped: the ring wrapped before it was read
         }
-        (void)cuEventRecord(timing.stop, lane.stream);
+        (void)cuEventRecord(timing.stop, stream_);
         timing.pending = true;
 
         // And a host function behind it, which the driver runs when the stream
         // reaches it -- Metal's completion handler, spelled differently.
         //
-        // The lane is the whole payload. Allocating a {device, submission}
-        // pair per dispatch would be a malloc on the frame path; instead the
+        // `this` is the whole payload. Allocating a {device, submission} pair
+        // per dispatch would be a malloc on the frame path; instead the
         // callback counts, and because host functions on one stream run in
-        // order the Nth of them is the Nth dispatch on that lane. Nothing
-        // inside it touches a CUDA API, which the driver forbids there.
-        ++lane.submitted;
-        (void)ok(cuLaunchHostFunc(lane.stream, &CudaDevice::onCompleted, &lane),
+        // order the Nth of them is the Nth dispatch. Nothing inside it touches
+        // a CUDA API, which the driver forbids there.
+        ++submitted_;
+        (void)ok(cuLaunchHostFunc(stream_, &CudaDevice::onCompleted, this),
                  "cuLaunchHostFunc");
     }
 
@@ -787,9 +724,7 @@ public:
         // Both, because a caller asking for everything to be finished means
         // both the work and the transfers.
         (void)ok(cuStreamSynchronize(copyStream_), "copyStreamSync");
-        for (uint32_t i = 0; i < laneCount_; ++i) {
-            (void)ok(cuStreamSynchronize(lanes_[i].stream), "streamSync");
-        }
+        (void)ok(cuStreamSynchronize(stream_), "streamSync");
     }
 
 private:
@@ -835,82 +770,12 @@ private:
 
     struct Kernel {
         std::string name;
-        /// Where its PTX is, to load it again for another lane.
-        const kernels::Blob* blob = nullptr;
+        CUfunction  function = nullptr;
+        CUdeviceptr globals = 0;
         size_t      globalsBytes = 0;
         /// The blob's trailer, if it had one. See gpe/kernels.h.
         std::optional<KernelInfo> info;
     };
-
-    /// A kernel as one lane has it: its own module, so its own block.
-    struct LaneKernel {
-        CUmodule    module = nullptr;
-        CUfunction  function = nullptr;
-        CUdeviceptr globals = 0;
-        size_t      globalsBytes = 0;
-    };
-
-    /// One stream of work. Lane 0 is the stream this device always had.
-    struct Lane {
-        CudaDevice* owner = nullptr;
-        LaneId      index = 0;
-        CUstream    stream = nullptr;
-        /// Recorded behind this lane's work, so an upload can wait for it.
-        CUevent     computeDone = nullptr;
-        bool        computePending = false;
-        /// An upload this lane's next work must wait for.
-        bool        uploadPending = false;
-        /// This lane's own count, matching the pool's for the lane because
-        /// both increment once per dispatch or fill on it and nothing else does.
-        uint64_t              submitted = 0;
-        std::atomic<uint64_t> finished{0};
-        /// By KernelId - 1; empty entries not loaded on this lane yet.
-        std::vector<LaneKernel> kernels;
-        std::vector<CUmodule>   modules;
-    };
-
-    /// Loads `kernel`'s PTX as a module of its own.
-    bool loadModule(const Kernel& kernel, LaneKernel& into) {
-        // The PTX is text and the blob is not terminated, so it is copied into
-        // a string first. Once per kernel and lane, ever.
-        const std::string ptx(reinterpret_cast<const char*>(kernel.blob->data),
-                              kernel.blob->size);
-        if (!ok(cuModuleLoadData(&into.module, ptx.c_str()), "cuModuleLoadData")) {
-            return false;
-        }
-        const std::string entry(kernel.blob->entry);
-        if (!ok(cuModuleGetFunction(&into.function, into.module, entry.c_str()),
-                "cuModuleGetFunction") ||
-            !ok(cuModuleGetGlobal(&into.globals, &into.globalsBytes, into.module,
-                                  "SLANG_globalParams"),
-                "cuModuleGetGlobal")) {
-            cuModuleUnload(into.module);
-            into = LaneKernel{};
-            return false;
-        }
-        return true;
-    }
-
-    /// The kernel as `lane` has it, loading it there on first use.
-    const LaneKernel* kernelOn(Lane& lane, KernelId id) {
-        if (lane.kernels.size() < kernels_.size()) {
-            lane.kernels.resize(kernels_.size());
-        }
-        LaneKernel& mine = lane.kernels[id - 1];
-        if (mine.module == nullptr) {
-            if (!loadModule(kernels_[id - 1], mine)) {
-                return nullptr;
-            }
-            lane.modules.push_back(mine.module);
-        }
-        return &mine;
-    }
-
-    /// The calling thread's lane, clamped to the ones that are open.
-    [[nodiscard]] Lane& here() {
-        const LaneId lane = currentLane();
-        return lanes_[lane < laneCount_ ? lane : laneCount_ - 1];
-    }
 
     /// Matches [numthreads(16, 16, 1)] in the kernels. One place, and
     /// common.slang says the same numbers on the other side.
@@ -990,9 +855,9 @@ private:
     }
 
     static void CUDA_CB onCompleted(void* userData) {
-        auto* lane = static_cast<Lane*>(userData);
-        lane->owner->reportCompleted(
-            lane->finished.fetch_add(1, std::memory_order_relaxed) + 1, 0.0, lane->index);
+        auto* self = static_cast<CudaDevice*>(userData);
+        self->reportCompleted(
+            self->finished_.fetch_add(1, std::memory_order_relaxed) + 1);
     }
 
     [[nodiscard]] Allocation* find(BufferId id) {
@@ -1016,6 +881,7 @@ private:
     CUcontext   context_ = nullptr;
     /// Made by somebody else; not released here.
     bool        adoptedContext_ = false;
+    CUstream    stream_ = nullptr;
     CUdeviceptr staging_[kStagingSlots]{};
     void*       pinned_[kStagingSlots]{};
     CUevent     stagingDone_[kStagingSlots]{};
@@ -1024,18 +890,24 @@ private:
     /// The globals struct being built, kept so that building it allocates
     /// nothing after the first dispatch. See its use.
     std::vector<unsigned char> globals_;
+    /// This backend's own count, matching the pool's because both increment
+    /// once per dispatch and nothing else does.
+    uint64_t              submitted_ = 0;
+    std::atomic<uint64_t> finished_{0};
     Timing                timings_[kTimingSlots]{};
     int                   timingAt_ = 0;
     CUstream              copyStream_ = nullptr;
     CUevent               copyDone_ = nullptr;
+    CUevent               computeDone_ = nullptr;
+    bool                  computePending_ = false;
+    bool                  uploadPending_ = false;
     std::vector<HostBlock> hostBlocks_;
     UploadSlot            uploads_[kUploadSlots]{};
     int                   uploadAt_ = 0;
 
     std::vector<Allocation> buffers_;
     std::vector<Kernel>     kernels_;
-    Lane                    lanes_[kMaxLanes]{};
-    uint32_t                laneCount_ = 1;
+    std::vector<CUmodule>   modules_;
 };
 
 }   // namespace

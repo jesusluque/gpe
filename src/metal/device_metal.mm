@@ -53,7 +53,6 @@
 #include "gpe/adopt.h"
 #include "gpe/args.h"
 #include "gpe/device.h"
-#include "gpe/lane.h"
 #include "kernel_registry.h"
 
 namespace gpe {
@@ -84,21 +83,12 @@ private:
 
 class MetalDevice final : public Device,
                          public CompletionReporting,
-                         public HostStaging,
-                         public LaneBackend {
+                         public HostStaging {
 public:
     ~MetalDevice() override {
         sync();
-        for (Lane& lane : lanes_) {
-            if (lane.previous != nullptr) {
-                lane.previous->release();
-            }
-            if (lane.computeEvent != nullptr) {
-                lane.computeEvent->release();
-            }
-            if (lane.queue != nullptr) {
-                lane.queue->release();
-            }
+        if (previous_ != nullptr) {
+            previous_->release();
         }
         if (lastBlit_ != nullptr) {
             lastBlit_->release();
@@ -132,8 +122,14 @@ public:
         if (uploadEvent_ != nullptr) {
             uploadEvent_->release();
         }
+        if (computeEvent_ != nullptr) {
+            computeEvent_->release();
+        }
         if (blitQueue_ != nullptr) {
             blitQueue_->release();
+        }
+        if (queue_ != nullptr) {
+            queue_->release();
         }
         if (device_ != nullptr) {
             device_->release();
@@ -150,12 +146,12 @@ public:
         device_ = device->retain();
         // The renderer's queue when it offers one: Metal orders command buffers
         // on a queue by commit, so its work and ours need nothing between them.
-        lanes_[0].queue = queue != nullptr ? queue->retain() : device_->newCommandQueue();
+        queue_ = queue != nullptr ? queue->retain() : device_->newCommandQueue();
         blitQueue_ = device_->newCommandQueue();
         uploadEvent_ = device_->newEvent();
-        lanes_[0].computeEvent = device_->newEvent();
-        return lanes_[0].queue != nullptr && blitQueue_ != nullptr &&
-               uploadEvent_ != nullptr && lanes_[0].computeEvent != nullptr;
+        computeEvent_ = device_->newEvent();
+        return queue_ != nullptr && blitQueue_ != nullptr &&
+               uploadEvent_ != nullptr && computeEvent_ != nullptr;
     }
 
     [[nodiscard]] bool open() {
@@ -163,7 +159,7 @@ public:
         if (device_ == nullptr) {
             return false;
         }
-        lanes_[0].queue = device_->newCommandQueue();
+        queue_ = device_->newCommandQueue();
         // A second queue for transfers, and an event to order them against the
         // first. Same reason as the CUDA copy stream: a blit and a kernel on
         // two queues run at once because they are different hardware, not
@@ -171,38 +167,9 @@ public:
         // gets the whole of the benefit.
         blitQueue_ = device_->newCommandQueue();
         uploadEvent_ = device_->newEvent();
-        lanes_[0].computeEvent = device_->newEvent();
-        return lanes_[0].queue != nullptr && blitQueue_ != nullptr &&
-               uploadEvent_ != nullptr && lanes_[0].computeEvent != nullptr;
-    }
-
-    // --- LaneBackend -------------------------------------------------------
-    //
-    // A lane is a command queue of its own, with its own batch and its own
-    // event for transfers to wait on. The uniforms need nothing: setBytes puts
-    // them in the command buffer, so two lanes running one kernel never share
-    // a parameter block -- the problem the CUDA backend has to copy modules
-    // to solve does not exist here.
-
-    uint32_t openLanes(uint32_t count) override {
-        count = std::min(std::max(count, 1u), kMaxLanes);
-        for (uint32_t i = laneCount_; i < count; ++i) {
-            lanes_[i].queue = device_->newCommandQueue();
-            lanes_[i].computeEvent = device_->newEvent();
-            if (lanes_[i].queue == nullptr || lanes_[i].computeEvent == nullptr) {
-                count = i;
-                break;
-            }
-        }
-        laneCount_ = std::max(laneCount_, count);
-        return laneCount_;
-    }
-
-    void flushLane(LaneId lane) override {
-        if (lane < laneCount_) {
-            const ScopedPool drain;
-            flushBatch(lanes_[lane]);
-        }
+        computeEvent_ = device_->newEvent();
+        return queue_ != nullptr && blitQueue_ != nullptr &&
+               uploadEvent_ != nullptr && computeEvent_ != nullptr;
     }
 
     [[nodiscard]] Backend backend() const override { return Backend::Metal; }
@@ -214,11 +181,8 @@ public:
     [[nodiscard]] uint64_t backendDevice() const override {
         return reinterpret_cast<uint64_t>(device_);
     }
-    /// The calling thread's lane's queue: a runtime enqueuing its own work
-    /// lands it behind this lane's kernels, which is what it is for.
     [[nodiscard]] uint64_t backendQueue() const override {
-        return reinterpret_cast<uint64_t>(
-            const_cast<MetalDevice*>(this)->here().queue);
+        return reinterpret_cast<uint64_t>(queue_);
     }
 
     /// An `MTL::Buffer*` somebody else made on this device, retained for as
@@ -282,7 +246,7 @@ public:
         // Copying them into a second shared buffer first would be 33 MB of
         // memcpy per frame to arrive where they already were.
         if (MTL::Buffer* source = hostBufferFor(src, bytes); source != nullptr) {
-            flushAllBatches();
+            flushBatch();
             MTL::CommandBuffer* direct = blitQueue_->commandBuffer();
             awaitCompute(direct);
             MTL::BlitCommandEncoder* encoder = direct->blitCommandEncoder();
@@ -298,6 +262,7 @@ public:
             }
             direct->retain();
             lastBlit_ = direct;
+            uploadPending_ = true;
             return;
         }
 
@@ -315,10 +280,7 @@ public:
         }
         std::memcpy(staging->contents(), src, bytes);
 
-        // Every lane's batch, not only this thread's: the blit waits for the
-        // compute work queued so far, and work still in an open batch has
-        // not signalled anything to wait for.
-        flushAllBatches();
+        flushBatch();
         MTL::CommandBuffer* commands = blitQueue_->commandBuffer();
         awaitCompute(commands);
         MTL::BlitCommandEncoder* blit = commands->blitCommandEncoder();
@@ -340,6 +302,7 @@ public:
         }
         commands->retain();
         lastBlit_ = commands;
+        uploadPending_ = true;
     }
 
     void download(void* dst, BufferId id, size_t bytes) override {
@@ -369,17 +332,19 @@ public:
         if (readback_ == nullptr) {
             return;
         }
-        Lane& lane = here();
-        flushBatch(lane);
-        MTL::CommandBuffer* commands = lane.queue->commandBuffer();
+        flushBatch();
+        MTL::CommandBuffer* commands = queue_->commandBuffer();
         // Ordered against the transfers, exactly as a dispatch is.
         //
-        // The uploads go to `blitQueue_` and this reads on the lane's queue:
-        // two queues, so without the wait a download issued right after an
-        // upload -- with no dispatch between them to carry the wait -- can
-        // overtake it and return the previous contents. The CUDA side handles
-        // the same case by waiting on its copy event, and says so.
-        awaitUploads(lane, commands);
+        // The uploads go to `blitQueue_` and this reads on `queue_`: two
+        // queues, so without the wait a download issued right after an upload
+        // -- with no dispatch between them to carry the wait -- can overtake it
+        // and return the previous contents. The CUDA side handles the same case
+        // by waiting on its copy event, and says so.
+        if (uploadPending_) {
+            commands->encodeWait(uploadEvent_, uploadValue_);
+            uploadPending_ = false;
+        }
         MTL::BlitCommandEncoder* blit = commands->blitCommandEncoder();
         blit->copyFromBuffer(*slot, 0, readback_, 0, bytes);
         blit->endEncoding();
@@ -407,7 +372,7 @@ public:
     /// middle of writing, and the symptom was a node thumbnail that came out
     /// black -- the render was right, the clear landed after it.
     ///
-    /// Queued on its lane's queue it is ordered against every kernel by the queue
+    /// Queued on `queue_` it is ordered against every kernel by the queue
     /// itself, which is what the buffer being cleared is about to be used by.
     /// Nothing to signal and nothing to wait for.
     [[nodiscard]] bool fill(BufferId id, uint8_t byte, size_t bytes) override {
@@ -419,29 +384,20 @@ public:
         if (bytes > (*slot)->length()) {
             return false;
         }
-        Lane& lane = here();
-        flushBatch(lane);
-        MTL::CommandBuffer* commands = lane.queue->commandBuffer();
+        flushBatch();
+        MTL::CommandBuffer* commands = queue_->commandBuffer();
         MTL::BlitCommandEncoder* blit = commands->blitCommandEncoder();
         blit->fillBuffer(*slot, NS::Range::Make(0, bytes), byte);
         blit->endEncoding();
-        noteCompute(lane, commands);
-        // A submission of its own, numbered and reported like a batch: the
-        // pool counts it, so a lane that reads this buffer next can wait for
-        // the clear by number.
-        const uint64_t submission = ++lane.submitted;
-        const LaneId   index = static_cast<LaneId>(&lane - lanes_);
-        commands->addCompletedHandler(^(MTL::CommandBuffer*) {
-            reportCompleted(submission, 0.0, index);
-        });
+        noteCompute(commands);
         commands->commit();
-        // Kept as the last thing on the lane's queue, so `sync()` waits for
+        // Kept as the last thing on the compute queue, so `sync()` waits for
         // it like it waits for a dispatch.
         commands->retain();
-        if (lane.previous != nullptr) {
-            lane.previous->release();
+        if (previous_ != nullptr) {
+            previous_->release();
         }
-        lane.previous = commands;
+        previous_ = commands;
         return true;
     }
 
@@ -549,12 +505,11 @@ public:
         // Uploads issued since the batch opened must land before this
         // kernel, and a wait can only be encoded before a command buffer's
         // first encoder: so the batch that cannot carry it goes now.
-        Lane& lane = here();
-        if (lane.batch != nullptr && lane.uploadSeen < uploadValue_) {
-            flushBatch(lane);
+        if (batch_ != nullptr && uploadPending_) {
+            flushBatch();
         }
-        openBatch(lane);
-        MTL::ComputeCommandEncoder* encoder = lane.encoder;
+        openBatch();
+        MTL::ComputeCommandEncoder* encoder = batchEncoder_;
         encoder->setComputePipelineState(kernel.pipeline);
 
         for (uint32_t i = 0; i < view.bufferCount; ++i) {
@@ -597,15 +552,15 @@ public:
         // Numbered now, reported when the batch it is in completes: the
         // pool's rule is "everything up to N", which a batch satisfies for
         // its last number.
-        lane.batchLast = ++lane.submitted;
-        if (++lane.batched >= kBatchLimit) {
-            flushBatch(lane);
+        batchLast_ = ++submitted_;
+        if (++batched_ >= kBatchLimit) {
+            flushBatch();
         }
     }
 
     void flush() override {
         const ScopedPool drain;
-        flushBatch(here());
+        flushBatch();
     }
 
     // --- HostStaging -------------------------------------------------------
@@ -678,10 +633,12 @@ public:
             }
             return;
         }
-        Lane& lane = here();
-        flushBatch(lane);
-        MTL::CommandBuffer* commands = lane.queue->commandBuffer();
-        awaitUploads(lane, commands);
+        flushBatch();
+        MTL::CommandBuffer* commands = queue_->commandBuffer();
+        if (uploadPending_) {
+            commands->encodeWait(uploadEvent_, uploadValue_);
+            uploadPending_ = false;
+        }
         MTL::BlitCommandEncoder* blit = commands->blitCommandEncoder();
         blit->copyFromBuffer(*slot, 0, staging, 0, bytes);
         blit->endEncoding();
@@ -702,53 +659,28 @@ public:
         });
         commands->commit();
         commands->retain();
-        if (lane.previous != nullptr) {
-            lane.previous->release();
+        if (previous_ != nullptr) {
+            previous_->release();
         }
-        lane.previous = commands;
+        previous_ = commands;
     }
 
     void sync() override {
         {
             const ScopedPool drain;
-            flushAllBatches();
+            flushBatch();
         }
-        // Every queue: a caller asking for everything to be finished means the
-        // transfers as well as the work, on every lane.
+        // Both queues: a caller asking for everything to be finished means the
+        // transfers as well as the work.
         if (lastBlit_ != nullptr) {
             lastBlit_->waitUntilCompleted();
         }
-        for (uint32_t i = 0; i < laneCount_; ++i) {
-            if (lanes_[i].previous != nullptr) {
-                lanes_[i].previous->waitUntilCompleted();
-            }
+        if (previous_ != nullptr) {
+            previous_->waitUntilCompleted();
         }
     }
 
 private:
-    /// One queue of work. Lane 0 is the queue this backend always had.
-    struct Lane {
-        MTL::CommandQueue* queue = nullptr;
-        /// The open batch. See openBatch.
-        MTL::CommandBuffer*         batch = nullptr;
-        MTL::ComputeCommandEncoder* encoder = nullptr;
-        uint32_t                    batched = 0;
-        uint64_t                    batchLast = 0;
-        /// This lane's own count, which matches the pool's for the lane
-        /// because both increment once per dispatch or fill on it and
-        /// nothing else.
-        uint64_t submitted = 0;
-        /// The last command buffer committed here, for sync to wait on.
-        MTL::CommandBuffer* previous = nullptr;
-        /// Signalled behind this lane's work, so an upload can wait for it.
-        /// See awaitCompute.
-        MTL::Event* computeEvent = nullptr;
-        uint64_t    computeValue = 0;
-        bool        computePending = false;
-        /// The upload value this lane's queue last waited for.
-        uint64_t uploadSeen = 0;
-    };
-
     struct Staging {
         MTL::Buffer* buffer = nullptr;
         /// The blit that last read this slot, retained until it has run.
@@ -870,34 +802,30 @@ private:
     /// keeps flowing to the device inside a long frame. A host that shares
     /// this queue with another runtime calls flush() before that runtime
     /// submits work reading gpe's results.
-    void openBatch(Lane& lane) {
-        if (lane.batch != nullptr) {
+    void openBatch() {
+        if (batch_ != nullptr) {
             return;
         }
-        lane.batch = lane.queue->commandBuffer()->retain();
+        batch_ = queue_->commandBuffer()->retain();
         // Wait for whatever was uploaded since the last batch, and for nothing
         // else. Without it a kernel could read a buffer whose blit is still
         // running; with a full wait instead there would be no overlap left.
-        awaitUploads(lane, lane.batch);
-        lane.encoder = lane.batch->computeCommandEncoder()->retain();
-    }
-
-    void flushAllBatches() {
-        for (uint32_t i = 0; i < laneCount_; ++i) {
-            flushBatch(lanes_[i]);
+        if (uploadPending_) {
+            batch_->encodeWait(uploadEvent_, uploadValue_);
+            uploadPending_ = false;
         }
+        batchEncoder_ = batch_->computeCommandEncoder()->retain();
     }
 
-    void flushBatch(Lane& lane) {
-        if (lane.batch == nullptr) {
+    void flushBatch() {
+        if (batch_ == nullptr) {
             return;
         }
-        lane.encoder->endEncoding();
-        lane.encoder->release();
-        lane.encoder = nullptr;
-        noteCompute(lane, lane.batch);
-        const uint64_t submission = lane.batchLast;
-        const LaneId   index = static_cast<LaneId>(&lane - lanes_);
+        batchEncoder_->endEncoding();
+        batchEncoder_->release();
+        batchEncoder_ = nullptr;
+        noteCompute(batch_);
+        const uint64_t submission = batchLast_;
         // The **block** overload, not the std::function one.
         //
         // metal-cpp's std::function overload copies it into a `__block`
@@ -907,36 +835,26 @@ private:
         // detector -- so every dispatch produced a ThreadSanitizer report
         // pointing into MTLCommandBuffer.hpp. A block captures `this` and the
         // number by value directly: no byref storage, no std::function.
-        lane.batch->addCompletedHandler(^(MTL::CommandBuffer* done) {
+        batch_->addCompletedHandler(^(MTL::CommandBuffer* done) {
             // The device's own clock, read off the command buffer: the whole
             // batch, which is what a frame's dispatches are.
             const double seconds = done->GPUEndTime() - done->GPUStartTime();
-            reportCompleted(submission, seconds * 1000.0, index);
+            reportCompleted(submission, seconds * 1000.0);
         });
         // Returns without waiting. `sync` is what waits.
-        lane.batch->commit();
-        if (lane.previous != nullptr) {
-            lane.previous->release();
+        batch_->commit();
+        if (previous_ != nullptr) {
+            previous_->release();
         }
-        lane.previous = lane.batch;   // already retained
-        lane.batch = nullptr;
-        lane.batched = 0;
+        previous_ = batch_;   // already retained
+        batch_ = nullptr;
+        batched_ = 0;
     }
 
-    /// Remembers that a lane's queue has work an upload must not overtake.
-    void noteCompute(Lane& lane, MTL::CommandBuffer* commands) {
-        commands->encodeSignalEvent(lane.computeEvent, ++lane.computeValue);
-        lane.computePending = true;
-    }
-
-    /// Orders this lane's next command buffer behind the uploads it has not
-    /// waited for yet. One blit queue, one event, values only climbing: a
-    /// lane remembers the last value it waited for.
-    void awaitUploads(Lane& lane, MTL::CommandBuffer* commands) {
-        if (lane.uploadSeen < uploadValue_) {
-            commands->encodeWait(uploadEvent_, uploadValue_);
-            lane.uploadSeen = uploadValue_;
-        }
+    /// Remembers that the compute queue has work an upload must not overtake.
+    void noteCompute(MTL::CommandBuffer* commands) {
+        commands->encodeSignalEvent(computeEvent_, ++computeValue_);
+        computePending_ = true;
     }
 
     /// Orders a transfer behind that work, once.
@@ -953,19 +871,10 @@ private:
     /// common case during a prepare, so the overlap these two queues exist for
     /// is kept everywhere it is safe to have.
     void awaitCompute(MTL::CommandBuffer* commands) {
-        for (uint32_t i = 0; i < laneCount_; ++i) {
-            Lane& lane = lanes_[i];
-            if (lane.computePending) {
-                commands->encodeWait(lane.computeEvent, lane.computeValue);
-                lane.computePending = false;
-            }
+        if (computePending_) {
+            commands->encodeWait(computeEvent_, computeValue_);
+            computePending_ = false;
         }
-    }
-
-    /// The calling thread's lane, clamped to the ones that are open.
-    [[nodiscard]] Lane& here() {
-        const LaneId lane = currentLane();
-        return lanes_[lane < laneCount_ ? lane : laneCount_ - 1];
     }
 
     [[nodiscard]] MTL::Buffer** find(BufferId id) {
@@ -983,22 +892,34 @@ private:
     }
 
     MTL::Device*       device_ = nullptr;
+    MTL::CommandQueue* queue_ = nullptr;
     MTL::CommandQueue*  blitQueue_ = nullptr;
     MTL::Event*         uploadEvent_ = nullptr;
     uint64_t            uploadValue_ = 0;
+    bool                uploadPending_ = false;
+    /// The other direction. See awaitCompute.
+    MTL::Event*         computeEvent_ = nullptr;
+    uint64_t            computeValue_ = 0;
+    bool                computePending_ = false;
     MTL::CommandBuffer* lastBlit_ = nullptr;
     /// The readback buffer, grown on demand and kept. See download.
     MTL::Buffer*        readback_ = nullptr;
     Staging             uploads_[kUploadSlots]{};
     int                 uploadAt_ = 0;
+    MTL::CommandBuffer* previous_ = nullptr;
+    /// The open batch. See openBatch.
+    MTL::CommandBuffer*         batch_ = nullptr;
+    MTL::ComputeCommandEncoder* batchEncoder_ = nullptr;
+    uint32_t                    batched_ = 0;
+    uint64_t                    batchLast_ = 0;
     static constexpr uint32_t   kBatchLimit = 64;
     /// Spare downloadAsync staging buffers. See takeReadbackStaging.
     std::mutex                  stagingGuard_;
     std::vector<MTL::Buffer*>   spareStaging_;
     static constexpr size_t     kSpareStaging = 4;
-
-    Lane     lanes_[kMaxLanes]{};
-    uint32_t laneCount_ = 1;
+    /// This backend's own count, which matches the pool's because both
+    /// increment once per dispatch and nothing else.
+    uint64_t            submitted_ = 0;
 
     std::vector<HostBuffer>   hostBuffers_;
     std::vector<MTL::Buffer*> buffers_;
