@@ -43,7 +43,15 @@ constexpr int kStepsPerDouble = 4;
 constexpr int kBucketCount =
     (kMaxBucketShift - kMinBucketShift) * kStepsPerDouble + 1;
 
+/// The calling thread's lane. See gpe/lane.h.
+thread_local LaneId tLane = 0;
+
 }   // namespace
+
+LaneId currentLane() noexcept { return tLane; }
+
+LaneScope::LaneScope(LaneId lane) noexcept : previous_(tLane) { tLane = lane; }
+LaneScope::~LaneScope() { tLane = previous_; }
 
 int PooledDevice::bucketFor(size_t bytes) noexcept {
     if (bytes <= kMinBucketBytes) {
@@ -75,6 +83,7 @@ PooledDevice::PooledDevice(std::unique_ptr<Device> native, size_t budgetBytes,
       budget_(budgetBytes),
       onPressure_(std::move(onPressure)),
       reporter_(dynamic_cast<const CompletionReporting*>(native_.get())),
+      laneBackend_(dynamic_cast<LaneBackend*>(native_.get())),
       freeByBucket_(kBucketCount) {
     // Slot zero is never handed out, so that a zero BufferId is invalid for the
     // same reason it is in the interface: an uninitialised handle must not
@@ -109,13 +118,75 @@ PooledDevice::~PooledDevice() {
     }
 }
 
-void PooledDevice::checkThread(const char* where) const {
-    const std::thread::id here = std::this_thread::get_id();
-    if (owner_ == std::thread::id{}) {
-        owner_ = here;
+LaneId PooledDevice::laneHere() const noexcept {
+    const uint32_t open = lanes();
+    const LaneId lane = currentLane();
+    return lane < open ? lane : open - 1;
+}
+
+uint32_t PooledDevice::openLanes(uint32_t count) {
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    if (laneBackend_ == nullptr) {
+        return lanes();
+    }
+    const uint32_t opened =
+        std::clamp(laneBackend_->openLanes(std::clamp(count, 1u, kMaxLanes)), 1u, kMaxLanes);
+    lanes_.store(opened, std::memory_order_release);
+    return opened;
+}
+
+void PooledDevice::absorbReported() noexcept {
+    if (reporter_ == nullptr) {
         return;
     }
-    if (owner_ == here || complainedAboutThread_) {
+    const uint32_t open = lanes();
+    for (LaneId lane = 0; lane < open; ++lane) {
+        notifyCompleted(lane, reporter_->completedSubmissions(lane));
+    }
+}
+
+void PooledDevice::settleAcrossLanes(Slot& slot, LaneId lane) {
+    if (slot.lastLane == lane || slot.lastUse == 0) {
+        return;
+    }
+    const Fence earlier{slot.lastLane, slot.lastUse};
+    absorbReported();
+    if (retired(earlier)) {
+        return;
+    }
+    // Another lane's work on this buffer is still queued. Make sure it has
+    // been handed to the device at all, then wait for it -- holding the lock,
+    // which costs the other lanes their encoding for as long as it takes, and
+    // is why gpe/lane.h asks the caller not to need it.
+    if (laneBackend_ != nullptr) {
+        laneBackend_->flushLane(earlier.lane);
+    }
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point deadline = Clock::now() + std::chrono::seconds(2);
+    while (!retired(earlier)) {
+        if (Clock::now() >= deadline) {
+            // A submission counted and never run; settled the blunt way.
+            native_->sync();
+            for (LaneId l = 0; l < lanes(); ++l) {
+                notifyCompleted(l, submitted_[l]);
+            }
+            break;
+        }
+        std::this_thread::yield();
+        absorbReported();
+    }
+}
+
+void PooledDevice::checkThread(const char* where) const {
+    const std::thread::id here = std::this_thread::get_id();
+    // One thread per lane is the design; a second on the same lane is what
+    // this says something about.
+    std::thread::id& owner = owner_[laneHere()];
+    if (owner == std::thread::id{}) {
+        owner = here;
+        return;
+    }
+    if (owner == here || complainedAboutThread_) {
         return;
     }
     complainedAboutThread_ = true;
@@ -188,11 +259,17 @@ void PooledDevice::reclaimLocked() {
     // completion handler stores a number; this reads it and does all the work
     // on the render thread, so there is no lock and nothing for a driver
     // callback to contend on.
-    if (reporter_ != nullptr) {
-        notifyCompleted(reporter_->completedSubmissions());
-    }
-    const Submission done = completed_.load(std::memory_order_acquire);
-    while (!retiring_.empty() && retiring_.front().at <= done) {
+    absorbReported();
+    const uint32_t open = lanes();
+    const auto free = [this, open](const Retiring& entry) {
+        for (LaneId lane = 0; lane < open; ++lane) {
+            if (completed_[lane].load(std::memory_order_acquire) < entry.at[lane]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    while (!retiring_.empty() && free(retiring_.front())) {
         const Retiring entry = retiring_.front();
         retiring_.pop_front();
         Slot& slot = slots_[entry.slot];
@@ -219,7 +296,9 @@ bool PooledDevice::makeRoom(size_t bytes) {
     // 2. Wait for the device, then drain again. This is the first step that
     //    costs real time, which is exactly why `alloc` is a prepare-time call.
     native_->sync();
-    completed_.store(submitted_, std::memory_order_release);
+    for (LaneId lane = 0; lane < lanes(); ++lane) {
+        notifyCompleted(lane, submitted_[lane]);
+    }
     reclaimLocked();
     if (stats_.bytesHeld + bytes <= budget_) {
         return true;
@@ -347,7 +426,12 @@ void PooledDevice::release(BufferId id) {
         recycledSlots_.push_back(index);
         return;
     }
-    retiring_.push_back(Retiring{index, submitted_});
+    Retiring entry;
+    entry.slot = index;
+    for (LaneId lane = 0; lane < kMaxLanes; ++lane) {
+        entry.at[lane] = submitted_[lane];
+    }
+    retiring_.push_back(entry);
     stats_.bytesPending += slot->bucketBytes;
 }
 
@@ -363,7 +447,8 @@ void PooledDevice::upload(BufferId id, const void* src, size_t bytes) {
 
 void PooledDevice::download(void* dst, BufferId id, size_t bytes) {
     const std::lock_guard<std::recursive_mutex> held(guard_);
-    if (const Slot* slot = resolve(id); slot != nullptr) {
+    if (Slot* slot = resolve(id); slot != nullptr) {
+        settleAcrossLanes(*slot, laneHere());
         native_->download(dst, slot->native, bytes);
     } else {
         complainStale("download", id);
@@ -372,11 +457,17 @@ void PooledDevice::download(void* dst, BufferId id, size_t bytes) {
 
 bool PooledDevice::fill(BufferId id, uint8_t byte, size_t bytes) {
     const std::lock_guard<std::recursive_mutex> held(guard_);
-    const Slot* slot = resolve(id);
+    Slot* slot = resolve(id);
     if (slot == nullptr) {
         complainStale("fill", id);
         return false;
     }
+    const LaneId lane = laneHere();
+    settleAcrossLanes(*slot, lane);
+    // A fill is queued on the lane like a dispatch and ordered with its work,
+    // though it is not counted as a submission: the next dispatch on this
+    // lane is what marks the buffer's use.
+    noteUse(*slot, lane);
     return native_->fill(slot->native, byte, bytes);
 }
 
@@ -411,6 +502,7 @@ void PooledDevice::dispatch(KernelId kernel, Grid grid, const void* args,
     // Translated in place into a member so the bytes outlive the call, and a
     // blob that does not parse is passed through rather than mangled -- a
     // backend may one day take something that is not an Args.
+    const LaneId lane = laneHere();
     const void* forward = args;
     size_t      forwardBytes = bytes;
     if (const Args::View view = Args::read(args, bytes);
@@ -421,10 +513,16 @@ void PooledDevice::dispatch(KernelId kernel, Grid grid, const void* args,
             translated_.data() + 2 * sizeof(uint32_t));
         for (uint32_t i = 0; i < view.bufferCount; ++i) {
             const BufferId pooled = handles[i];
-            handles[i] = nativeHandle(pooled);
-            if (handles[i] == kInvalidBuffer && pooled != kInvalidBuffer) {
-                complainStale("dispatch", pooled);
+            Slot* slot = resolve(pooled);
+            handles[i] = slot != nullptr ? slot->native : kInvalidBuffer;
+            if (slot == nullptr) {
+                if (pooled != kInvalidBuffer) {
+                    complainStale("dispatch", pooled);
+                }
+                continue;
             }
+            settleAcrossLanes(*slot, lane);
+            noteUse(*slot, lane);
         }
         forward = translated_.data();
         forwardBytes = translated_.size();
@@ -435,7 +533,7 @@ void PooledDevice::dispatch(KernelId kernel, Grid grid, const void* args,
     // between waiting for the work that touched it and waiting for the work
     // that did not.
     checkThread("dispatch");
-    ++submitted_;
+    ++submitted_[lane];
     native_->dispatch(kernel, grid, forward, forwardBytes);
 }
 
@@ -444,8 +542,10 @@ void PooledDevice::sync() {
     native_->sync();
     // A backend with completion handlers publishes this itself; doing it here
     // too costs nothing and keeps a backend that has none -- or a test -- from
-    // holding every retiring buffer forever.
-    completed_.store(submitted_, std::memory_order_release);
+    // holding every retiring buffer forever. Every lane: sync waits for all.
+    for (LaneId lane = 0; lane < lanes(); ++lane) {
+        notifyCompleted(lane, submitted_[lane]);
+    }
     reclaimLocked();
 }
 
@@ -454,20 +554,26 @@ void PooledDevice::flush() {
     native_->flush();
 }
 
-void PooledDevice::waitFor(Submission at) {
+void PooledDevice::waitFor(Fence at) {
     reclaim();
     if (retired(at)) {
         return;
     }
     // A backend holding the submission back in a batch would never report it:
-    // hand it over first, or every wait is a spin and a full sync.
-    flush();
+    // hand it over first, or every wait is a spin and a full sync. Its own
+    // lane's batch, which need not be the calling thread's.
+    {
+        const std::lock_guard<std::recursive_mutex> held(guard_);
+        if (laneBackend_ != nullptr) {
+            laneBackend_->flushLane(at.lane);
+        } else {
+            native_->flush();
+        }
+    }
     // Long enough for work that is nearly done to land, short enough not to
     // burn a core on a backend that will never publish anything.
     for (int spins = 0; spins < 10000; ++spins) {
-        if (reporter_ != nullptr) {
-            notifyCompleted(reporter_->completedSubmissions());
-        }
+        absorbReported();
         if (retired(at)) {
             return;
         }
@@ -478,14 +584,12 @@ void PooledDevice::waitFor(Submission at) {
     sync();
 }
 
-bool PooledDevice::waitRetired(Submission at, std::chrono::microseconds limit) {
+bool PooledDevice::waitRetired(Fence at, std::chrono::microseconds limit) {
     using Clock = std::chrono::steady_clock;
     // Everything read here is atomic or fixed at construction: the reporter's
-    // counter, this pool's watermark, and the pointer to the reporter.
+    // counters, this pool's watermarks, and the pointer to the reporter.
     const auto settle = [this, at] {
-        if (reporter_ != nullptr) {
-            notifyCompleted(reporter_->completedSubmissions());
-        }
+        absorbReported();
         return retired(at);
     };
     if (settle()) {

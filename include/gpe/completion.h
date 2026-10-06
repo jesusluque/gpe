@@ -22,6 +22,8 @@
 #include <atomic>
 #include <cstdint>
 
+#include "gpe/lane.h"
+
 namespace gpe {
 
 class CompletionReporting {
@@ -29,9 +31,16 @@ public:
     virtual ~CompletionReporting() = default;
 
     /// Every submission up to and including this one has finished on the
-    /// device. Monotonic.
+    /// device. Monotonic. Lane 0's, which is the only lane a backend without
+    /// lanes has.
     [[nodiscard]] uint64_t completedSubmissions() const noexcept {
-        return completed_.load(std::memory_order_acquire);
+        return completedSubmissions(0);
+    }
+
+    /// The same for one lane. Each lane counts its own submissions from one,
+    /// and they finish in order within a lane and in any order across lanes.
+    [[nodiscard]] uint64_t completedSubmissions(LaneId lane) const noexcept {
+        return lane < kMaxLanes ? completed_[lane].load(std::memory_order_acquire) : 0;
     }
 
     /// How long the device spent on the most recent submission it finished, in
@@ -49,22 +58,27 @@ protected:
     /// Called from the driver's completion handler, on the driver's thread.
     /// Stores and returns; no locks, no allocation, nothing that could call
     /// back into the engine.
-    void reportCompleted(uint64_t submission, double gpuMs = 0.0) noexcept {
+    void reportCompleted(uint64_t submission, double gpuMs = 0.0,
+                         LaneId lane = 0) noexcept {
         if (gpuMs > 0.0) {
             gpuMs_.store(gpuMs, std::memory_order_relaxed);
+        }
+        if (lane >= kMaxLanes) {
+            return;
         }
         // Monotonic even if handlers arrive out of order, which they may:
         // two command buffers can finish in either order and the pool's rule is
         // "everything up to N", not "N".
-        uint64_t seen = completed_.load(std::memory_order_relaxed);
+        std::atomic<uint64_t>& mark = completed_[lane];
+        uint64_t seen = mark.load(std::memory_order_relaxed);
         while (submission > seen &&
-               !completed_.compare_exchange_weak(seen, submission,
-                                                 std::memory_order_release,
-                                                 std::memory_order_relaxed)) {
+               !mark.compare_exchange_weak(seen, submission,
+                                           std::memory_order_release,
+                                           std::memory_order_relaxed)) {
         }
     }
 
-    std::atomic<uint64_t> completed_{0};
+    std::atomic<uint64_t> completed_[kMaxLanes]{};
     std::atomic<double>   gpuMs_{0.0};
 };
 
