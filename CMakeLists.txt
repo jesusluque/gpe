@@ -137,6 +137,8 @@ if(NOT DEFINED GPE_CUDA_ARCH)
 endif()
 set(GPE_CUDA_ARCH "${GPE_CUDA_ARCH_DEFAULT}" CACHE STRING
     "virtual architecture for nvcc -ptx; a floor, so the lowest card it must run on")
+set(GPE_NVCC_FLAGS "" CACHE STRING
+    "extra flags for nvcc -ptx, e.g. -allow-unsupported-compiler (see cmake/CompileSlang.cmake)")
 
 # --- the library --------------------------------------------------------------
 #
