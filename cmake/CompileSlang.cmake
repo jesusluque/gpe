@@ -112,6 +112,12 @@ function(gpe_compile_slang name)
             VERBATIM)
     elseif(GPE_BACKEND STREQUAL "CUDA")
         set(cu "${GPE_KERNEL_DIR}/${name}.cu")
+        # GPE_NVCC_FLAGS: anything else this nvcc needs. The case it exists
+        # for: the driver decides which PTX it can load, so the nvcc that
+        # writes it may have to be older than the newest toolkit installed --
+        # and an older nvcc refuses a host compiler newer than it knows
+        # ("unsupported Microsoft Visual Studio version"), although -ptx
+        # compiles no host code. -allow-unsupported-compiler answers that.
         # -ptx, not -cubin: PTX is forward compatible, so a binary built here
         # runs on a card that did not exist when it was built. The driver JITs
         # it once and caches the result.
@@ -121,7 +127,7 @@ function(gpe_compile_slang name)
                     -entry ${ARG_ENTRY} -stage compute -o "${cu}"
                     -reflection-json "${json}"
             COMMAND ${GPE_NVCC} -ptx "${cu}" -o "${blob}"
-                    -arch=${GPE_CUDA_ARCH}
+                    -arch=${GPE_CUDA_ARCH} ${GPE_NVCC_FLAGS}
             DEPENDS ${deps}
             WORKING_DIRECTORY "${GPE_ROOT}/kernels"
             COMMENT "slang -> ptx: ${name}"
