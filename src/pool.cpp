@@ -552,6 +552,77 @@ BufferId PooledDevice::adopt(uint64_t devicePtr, size_t bytes) {
     return (static_cast<BufferId>(slot.generation) << kBufferSlotBits) | index;
 }
 
+bool PooledDevice::copy(BufferId destination, BufferId source, size_t bytes) {
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    const Slot* to = resolve(destination);
+    const Slot* from = resolve(source);
+    if (to == nullptr || from == nullptr) {
+        return false;
+    }
+    return native_->copy(to->native, from->native, bytes);
+}
+
+BufferId PooledDevice::allocShareable(size_t bytes) {
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    const BufferId native = native_->allocShareable(bytes);
+    if (native == kInvalidBuffer) {
+        return kInvalidBuffer;
+    }
+    // Its own slot, and never a recycled one, for the same reason `adopt`
+    // takes one: this allocation is not interchangeable with the pool's. It is
+    // rounded up to the two-megabyte granularity the driver shares at, and
+    // another process may be holding a handle to it -- handing it back out as
+    // an ordinary buffer would give somebody a block a worker is still reading.
+    uint32_t index = 0;
+    if (!recycledSlots_.empty()) {
+        index = recycledSlots_.back();
+        recycledSlots_.pop_back();
+    } else {
+        index = static_cast<uint32_t>(slots_.size());
+        slots_.emplace_back();
+    }
+    Slot& slot = slots_[index];
+    slot.native = native;
+    slot.bucketBytes = bytes;
+    // Borrowed in the sense that matters here: released to the backend when
+    // the caller lets go, not returned to a free list.
+    slot.borrowed = true;
+    ++slot.generation;
+    slot.live = true;
+    ++stats_.liveBuffers;
+    return (static_cast<BufferId>(slot.generation) << kBufferSlotBits) | index;
+}
+
+uint64_t PooledDevice::exportShareable(BufferId id) const {
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    const Slot* slot = resolve(id);
+    return slot != nullptr ? native_->exportShareable(slot->native) : 0;
+}
+
+BufferId PooledDevice::importShareable(uint64_t handle, size_t bytes) {
+    const std::lock_guard<std::recursive_mutex> held(guard_);
+    const BufferId native = native_->importShareable(handle, bytes);
+    if (native == kInvalidBuffer) {
+        return kInvalidBuffer;
+    }
+    uint32_t index = 0;
+    if (!recycledSlots_.empty()) {
+        index = recycledSlots_.back();
+        recycledSlots_.pop_back();
+    } else {
+        index = static_cast<uint32_t>(slots_.size());
+        slots_.emplace_back();
+    }
+    Slot& slot = slots_[index];
+    slot.native = native;
+    slot.bucketBytes = bytes;
+    slot.borrowed = true;
+    ++slot.generation;
+    slot.live = true;
+    ++stats_.liveBuffers;
+    return (static_cast<BufferId>(slot.generation) << kBufferSlotBits) | index;
+}
+
 uint64_t PooledDevice::devicePointer(BufferId id) const {
     const std::lock_guard<std::recursive_mutex> held(guard_);
     const Slot* slot = resolve(id);
